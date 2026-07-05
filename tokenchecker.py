@@ -926,6 +926,14 @@ def cmd_status(args):
     if not repo:
         eprint("tokenchecker: not inside a git repository")
         return 1
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).strip()
+    print(f"repo:         {repo}" + (f" (branch {branch})" if branch else ""))
+    hook = os.path.join(git(repo, "rev-parse", "--git-path", "hooks").strip(), "pre-push")
+    if not os.path.isabs(hook):
+        hook = os.path.join(repo, hook)
+    installed = os.path.exists(hook) and PRE_PUSH_MARKER in open(
+        hook, encoding="utf-8", errors="replace").read()
+    print(f"pre-push hook: {'installed' if installed else 'NOT installed — run: python3 tokenchecker.py install'}")
     print(f"machine id:   {machine_id()}")
     store = load_local(repo)
     if store:

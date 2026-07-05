@@ -635,20 +635,6 @@ def local_store_path(repo):
     return os.path.join(git_dir(repo), LOCAL_DIR, RECORDS_BLOB)
 
 
-def log_path(repo):
-    return os.path.join(git_dir(repo), LOCAL_DIR, "log")
-
-
-def log_event(repo, message):
-    try:
-        path = log_path(repo)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(f"{iso(datetime.now(timezone.utc).timestamp())} {message}\n")
-    except OSError:
-        pass
-
-
 def load_jsonl(text):
     records = []
     for line in text.splitlines():
@@ -850,13 +836,11 @@ def cmd_collect(args):
     existing = load_local(repo)
     merged = dedup(existing + collected)
     save_local(repo, merged)
-    new = len(merged) - len(dedup(existing))
-    summary = (f"collected {len(collected)} records "
-               f"({', '.join(f'{k}={v}' for k, v in counts.items())}); "
-               f"{new} new; store has {len(merged)}")
-    log_event(repo, "collect: " + summary)
     if not args.quiet:
-        print(f"tokenchecker: {summary}")
+        new = len(merged) - len(dedup(existing))
+        print(f"tokenchecker: collected {len(collected)} records "
+              f"({', '.join(f'{k}={v}' for k, v in counts.items())}); "
+              f"{new} new; store has {len(merged)}")
     return 0
 
 
@@ -887,10 +871,8 @@ def cmd_push(args):
         env={**os.environ, "TOKENCHECKER_SKIP": "1"},
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        log_event(repo, f"push FAILED to {remote} {ref}: {p.stderr.strip().splitlines()[-1] if p.stderr.strip() else 'unknown error'}")
         eprint(f"tokenchecker: push of {ref} to {remote} failed:\n{p.stderr.strip()}")
         return 1
-    log_event(repo, f"push: {len(merged)} records -> {remote} {ref}")
     if not args.quiet:
         print(f"tokenchecker: pushed {len(merged)} records to {remote} {ref}")
     return 0
@@ -921,58 +903,14 @@ def cmd_report(args):
     return 0
 
 
-def cmd_status(args):
-    repo = repo_root(args.repo)
-    if not repo:
-        eprint("tokenchecker: not inside a git repository")
-        return 1
-    print(f"machine id:   {machine_id()}")
-    store = load_local(repo)
-    if store:
-        branches = sorted({r.get("branch", "?") for r in store})
-        last_ts = max((r.get("ts") or "" for r in store), default="")
-        print(f"local store:  {len(store)} records, {len(branches)} branch(es), "
-              f"newest record {last_ts or 'n/a'}")
-    else:
-        print("local store:  empty (run `sync` or `collect`, or just `git push`)")
-    lp = log_path(repo)
-    if os.path.exists(lp):
-        with open(lp, encoding="utf-8", errors="replace") as fh:
-            tail = fh.read().splitlines()[-args.log_lines:]
-        print(f"\nrecent runs (last {len(tail)} of {lp}):")
-        for line in tail:
-            print(f"  {line}")
-    else:
-        print("\nrecent runs:  none logged yet")
-    out = git(repo, "for-each-ref",
-              "--format=%(refname)|%(committerdate:iso8601)|%(committerdate:relative)",
-              REF_PREFIX + "*", check=False)
-    rows = [line.split("|") for line in out.splitlines() if line.strip()]
-    print("\nsynced machines (local refs):")
-    if rows:
-        for refname, date, rel in rows:
-            n = len(read_ref_records(repo, refname))
-            print(f"  {refname[len(REF_PREFIX):]:24s} {n:6d} records   last push {date} ({rel})")
-    else:
-        print("  none fetched — try: git fetch", args.remote,
-              f"'+{REF_PREFIX}*:{REF_PREFIX}*'")
-    ls = run(["git", "-C", repo, "ls-remote", args.remote, REF_PREFIX + "*"], check=False)
-    remote_refs = [line.split("\t")[1] for line in ls.splitlines() if "\t" in line]
-    if remote_refs:
-        print(f"\non {args.remote}: " + ", ".join(
-            r[len(REF_PREFIX):] for r in remote_refs))
-    return 0
-
-
 PRE_PUSH_MARKER = "# >>> tokenchecker pre-push >>>"
-PRE_PUSH_END_MARKER = "# <<< tokenchecker pre-push <<<"
 PRE_PUSH_BLOCK = """
 # >>> tokenchecker pre-push >>>
 # Collect local AI agent token usage and publish it to refs/token-usage/<machine>
 if [ -z "$TOKENCHECKER_SKIP" ]; then
   _tc_root="$(git rev-parse --show-toplevel 2>/dev/null)"
   if [ -n "$_tc_root" ] && [ -f "$_tc_root/scripts/tokenchecker.py" ]; then
-    TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync || true
+    TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync --quiet || true
   fi
 fi
 # <<< tokenchecker pre-push <<<
@@ -1005,7 +943,6 @@ jobs:
             --branch "${{ github.head_ref }}" \\
             --refs-only --markdown > tokenchecker-report.md
           cat tokenchecker-report.md
-          cat tokenchecker-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upsert PR comment
         uses: actions/github-script@v7
@@ -1068,18 +1005,7 @@ def cmd_install(args):
     if os.path.exists(hook_path):
         with open(hook_path, encoding="utf-8", errors="replace") as fh:
             existing = fh.read()
-    if PRE_PUSH_MARKER in existing:
-        # replace any stale block with the current one
-        pattern = re.compile(
-            re.escape(PRE_PUSH_MARKER) + r".*?" + re.escape(PRE_PUSH_END_MARKER) + r"\n?",
-            re.DOTALL)
-        updated = pattern.sub(PRE_PUSH_BLOCK.strip() + "\n", existing)
-        if updated != existing:
-            with open(hook_path, "w", encoding="utf-8") as fh:
-                fh.write(updated)
-            os.chmod(hook_path, 0o755)
-            changed.append(os.path.relpath(hook_path, repo) + " (hook block updated)")
-    else:
+    if PRE_PUSH_MARKER not in existing:
         content = existing if existing.strip() else "#!/bin/sh\n"
         with open(hook_path, "w", encoding="utf-8") as fh:
             fh.write(content.rstrip("\n") + "\n" + PRE_PUSH_BLOCK)
@@ -1168,11 +1094,6 @@ def main(argv=None):
     p.add_argument("--refs-only", dest="refs_only", action="store_true",
                    help="ignore the local store; use only synced refs (for CI)")
     p.set_defaults(fn=cmd_report)
-
-    p = sub.add_parser("status", help="show when tokenchecker last ran and what is synced")
-    common(p)
-    p.add_argument("--log-lines", type=int, default=10, help="log lines to show (default 10)")
-    p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("install", help="vendor script, add pre-push hook + workflow")
     common(p)

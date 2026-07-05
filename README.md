@@ -68,10 +68,24 @@ python3 scripts/tokenchecker.py install
 ```bash
 python3 scripts/tokenchecker.py sync                 # collect + publish (what the hook runs)
 python3 scripts/tokenchecker.py collect --dry-run    # preview per-branch usage, write nothing
+python3 scripts/tokenchecker.py status               # when did it last run, what's synced where
 python3 scripts/tokenchecker.py report               # all branches, all machines
 python3 scripts/tokenchecker.py report --branch feature/x --markdown  # PR-comment format
 python3 scripts/tokenchecker.py report --json        # raw records
 ```
+
+## Seeing it run
+
+- **On every `git push`** the hook prints two lines in your terminal:
+  ```
+  tokenchecker: collected 7 records (claude-code=4, codex=1, gemini=1, cursor=1); 0 new; store has 6
+  tokenchecker: pushed 6 records to origin refs/token-usage/laptop-a1b2c3d4
+  ```
+- **`status`** shows the machine id, the local store, a timestamped log of recent
+  collect/push runs (kept in `.git/tokenchecker/log`), every synced machine ref with its
+  last-push time, and which refs exist on origin.
+- **In CI**, the Action run appears in the PR's Checks tab; the rendered report is printed
+  in the job log and on the run's Summary page, in addition to the PR comment itself.
 
 Useful flags: `--since N` (lookback days, default 90), `--remote NAME` (default `origin`),
 `--repo PATH` (default: cwd).

@@ -42,7 +42,33 @@ override with env vars elsewhere).
    `refs/token-usage/*` refs, aggregates every machine's records for the head branch, and
    creates/updates a single sticky PR comment.
 
-## Setup (per repository)
+## Setup
+
+### Global (recommended): once per machine
+
+```bash
+python3 tokenchecker.py install --global
+```
+
+This copies the script to `~/.tokenchecker/`, adds a `tokenchecker` CLI wrapper at
+`~/.tokenchecker/bin/`, and sets git's global `core.hooksPath` to a directory of
+dispatcher hooks that **chain to each repository's own `.git/hooks/*` first**, then record
+token usage on `pre-push`. Every repo on the machine is covered automatically — no
+per-repo, per-clone setup.
+
+- Opt a repo out: `git config tokenchecker.enabled false`
+- Repos that set `core.hooksPath` themselves (e.g. husky) bypass the global hooks — add
+  the sync line to their hook system or use the per-repo install there.
+- If you already had a global `core.hooksPath`, the installer refuses to clobber it and
+  prints the one line to add to your existing pre-push hook.
+- Hook runs are quiet when there is nothing new; you only see output when records are
+  actually collected or pushed.
+
+PR comments still need two committed files per repository (CI can't read your laptop):
+run `python3 ~/.tokenchecker/tokenchecker.py install` in the repo once and commit
+`scripts/tokenchecker.py` + `.github/workflows/token-usage.yml`.
+
+### Per repository (alternative)
 
 ```bash
 # one time, by anyone: vendor the tool + workflow into the repo

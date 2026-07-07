@@ -47,7 +47,13 @@ override with env vars elsewhere).
 ### Global (recommended): once per machine
 
 ```bash
-python3 tokenchecker.py install --global
+pipx install tokenchecker        # or: uv tool install tokenchecker
+# or, straight from git (works for private forks too):
+#   pipx install git+https://github.com/ZohaibAhmed/tokenchecker
+# or, no package manager at all — the script is a single stdlib-only file:
+#   python3 tokenchecker.py install --global   (from a checkout)
+
+tokenchecker install --global
 ```
 
 This copies the script to `~/.tokenchecker/`, adds a `tokenchecker` CLI wrapper at

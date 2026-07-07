@@ -16,6 +16,8 @@ Commands:
   install   vendor this script, add pre-push hook + GitHub workflow
 """
 
+__version__ = "0.1.0"
+
 import argparse
 import getpass
 import glob
@@ -1274,6 +1276,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(prog="tokenchecker", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo", default=None, help="path inside the target repo (default: cwd)")
+    ap.add_argument("--version", action="version", version=f"tokenchecker {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     def common(p):

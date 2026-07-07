@@ -635,6 +635,20 @@ def local_store_path(repo):
     return os.path.join(git_dir(repo), LOCAL_DIR, RECORDS_BLOB)
 
 
+def log_path(repo):
+    return os.path.join(git_dir(repo), LOCAL_DIR, "log")
+
+
+def log_event(repo, message):
+    try:
+        path = log_path(repo)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{iso(datetime.now(timezone.utc).timestamp())} {message}\n")
+    except OSError:
+        pass
+
+
 def load_jsonl(text):
     records = []
     for line in text.splitlines():
@@ -836,11 +850,15 @@ def cmd_collect(args):
     existing = load_local(repo)
     merged = dedup(existing + collected)
     save_local(repo, merged)
-    if not args.quiet:
-        new = len(merged) - len(dedup(existing))
-        print(f"tokenchecker: collected {len(collected)} records "
-              f"({', '.join(f'{k}={v}' for k, v in counts.items())}); "
-              f"{new} new; store has {len(merged)}")
+    new = len(merged) - len(dedup(existing))
+    hook_mode = getattr(args, "hook", False)
+    summary = (f"collected {len(collected)} records "
+               f"({', '.join(f'{k}={v}' for k, v in counts.items())}); "
+               f"{new} new; store has {len(merged)}")
+    if not hook_mode or new > 0:
+        log_event(repo, "collect: " + summary)
+    if not args.quiet and (not hook_mode or new > 0):
+        print(f"tokenchecker: {summary}")
     return 0
 
 
@@ -849,9 +867,10 @@ def cmd_push(args):
     if not repo:
         eprint("tokenchecker: not inside a git repository")
         return 1
+    hook_mode = getattr(args, "hook", False)
     records = load_local(repo)
     if not records:
-        if not args.quiet:
+        if not args.quiet and not hook_mode:
             print("tokenchecker: no local records to push")
         return 0
     ref = REF_PREFIX + machine_id()
@@ -860,19 +879,28 @@ def cmd_push(args):
         json.dumps(r, sort_keys=True) + "\n"
         for r in sorted(merged, key=lambda r: (r.get("ts") or "", r["id"]))
     )
+    # the local ref tracks the last successful push; skip no-op force pushes
+    if git(repo, "cat-file", "blob", f"{ref}:{RECORDS_BLOB}", check=False) == payload:
+        if not args.quiet and not hook_mode:
+            print(f"tokenchecker: {ref} already up to date ({len(merged)} records)")
+        return 0
     blob = git(repo, "hash-object", "-w", "--stdin", input_=payload).strip()
     tree = git(repo, "mktree", input_=f"100644 blob {blob}\t{RECORDS_BLOB}\n").strip()
     commit = git(repo, "commit-tree", tree, "-m",
                  f"tokenchecker records from {machine_id()}").strip()
-    git(repo, "update-ref", ref, commit)
     remote = args.remote
     p = subprocess.run(
-        ["git", "-C", repo, "push", "--force", "--no-verify", remote, f"{ref}:{ref}"],
+        ["git", "-C", repo, "push", "--force", "--no-verify", remote, f"{commit}:{ref}"],
         env={**os.environ, "TOKENCHECKER_SKIP": "1"},
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
+        log_event(repo, f"push FAILED to {remote} {ref}: {p.stderr.strip().splitlines()[-1] if p.stderr.strip() else 'unknown error'}")
         eprint(f"tokenchecker: push of {ref} to {remote} failed:\n{p.stderr.strip()}")
         return 1
+    # only advance the local ref once origin has the records, so failed
+    # pushes are retried on the next run
+    git(repo, "update-ref", ref, commit)
+    log_event(repo, f"push: {len(merged)} records -> {remote} {ref}")
     if not args.quiet:
         print(f"tokenchecker: pushed {len(merged)} records to {remote} {ref}")
     return 0
@@ -903,18 +931,165 @@ def cmd_report(args):
     return 0
 
 
+def cmd_status(args):
+    repo = repo_root(args.repo)
+    if not repo:
+        eprint("tokenchecker: not inside a git repository")
+        return 1
+    branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).strip()
+    print(f"repo:         {repo}" + (f" (branch {branch})" if branch else ""))
+    hook = os.path.join(git(repo, "rev-parse", "--git-path", "hooks").strip(), "pre-push")
+    if not os.path.isabs(hook):
+        hook = os.path.join(repo, hook)
+    hook_text = ""
+    if os.path.exists(hook):
+        with open(hook, encoding="utf-8", errors="replace") as fh:
+            hook_text = fh.read()
+    if DISPATCHER_MARKER in hook_text:
+        enabled = git(repo, "config", "--get", "tokenchecker.enabled", check=False).strip()
+        state = "installed (global)" if enabled != "false" else \
+            "installed (global) but DISABLED for this repo (tokenchecker.enabled=false)"
+    elif PRE_PUSH_MARKER in hook_text:
+        state = "installed (repo)"
+    else:
+        state = "NOT installed — run: tokenchecker install --global (or install)"
+    print(f"pre-push hook: {state}")
+    print(f"machine id:   {machine_id()}")
+    store = load_local(repo)
+    if store:
+        branches = sorted({r.get("branch", "?") for r in store})
+        last_ts = max((r.get("ts") or "" for r in store), default="")
+        print(f"local store:  {len(store)} records, {len(branches)} branch(es), "
+              f"newest record {last_ts or 'n/a'}")
+    else:
+        print("local store:  empty (run `sync` or `collect`, or just `git push`)")
+    lp = log_path(repo)
+    if os.path.exists(lp):
+        with open(lp, encoding="utf-8", errors="replace") as fh:
+            tail = fh.read().splitlines()[-args.log_lines:]
+        print(f"\nrecent runs (last {len(tail)} of {lp}):")
+        for line in tail:
+            print(f"  {line}")
+    else:
+        print("\nrecent runs:  none logged yet")
+    out = git(repo, "for-each-ref",
+              "--format=%(refname)|%(committerdate:iso8601)|%(committerdate:relative)",
+              REF_PREFIX + "*", check=False)
+    rows = [line.split("|") for line in out.splitlines() if line.strip()]
+    print("\nsynced machines (local refs):")
+    if rows:
+        for refname, date, rel in rows:
+            n = len(read_ref_records(repo, refname))
+            print(f"  {refname[len(REF_PREFIX):]:24s} {n:6d} records   last push {date} ({rel})")
+    else:
+        print("  none fetched — try: git fetch", args.remote,
+              f"'+{REF_PREFIX}*:{REF_PREFIX}*'")
+    ls = run(["git", "-C", repo, "ls-remote", args.remote, REF_PREFIX + "*"], check=False)
+    remote_refs = [line.split("\t")[1] for line in ls.splitlines() if "\t" in line]
+    if remote_refs:
+        print(f"\non {args.remote}: " + ", ".join(
+            r[len(REF_PREFIX):] for r in remote_refs))
+    return 0
+
+
 PRE_PUSH_MARKER = "# >>> tokenchecker pre-push >>>"
+PRE_PUSH_END_MARKER = "# <<< tokenchecker pre-push <<<"
 PRE_PUSH_BLOCK = """
 # >>> tokenchecker pre-push >>>
 # Collect local AI agent token usage and publish it to refs/token-usage/<machine>
 if [ -z "$TOKENCHECKER_SKIP" ]; then
   _tc_root="$(git rev-parse --show-toplevel 2>/dev/null)"
   if [ -n "$_tc_root" ] && [ -f "$_tc_root/scripts/tokenchecker.py" ]; then
-    TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync --quiet || true
+    TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync --hook || true
   fi
 fi
 # <<< tokenchecker pre-push <<<
 """
+
+DISPATCHER_MARKER = "# tokenchecker global hook dispatcher"
+
+# Client-side hooks git may look for. With core.hooksPath set, git consults
+# ONLY that directory, so every dispatcher must chain to the repo's own hook.
+CLIENT_HOOKS = [
+    "applypatch-msg", "pre-applypatch", "post-applypatch",
+    "pre-commit", "pre-merge-commit", "prepare-commit-msg", "commit-msg",
+    "post-commit", "pre-rebase", "post-checkout", "post-merge", "pre-push",
+    "pre-auto-gc", "post-rewrite", "sendemail-validate", "post-index-change",
+]
+
+DISPATCHER_TEMPLATE = """#!/bin/sh
+{marker}
+# Installed by `tokenchecker install --global`. Chains to the repository's own
+# .git/hooks/<name> first, then records AI token usage on pre-push.
+hook_name="$(basename "$0")"
+repo_hooks="$(git rev-parse --git-dir 2>/dev/null)/hooks"
+if [ -x "$repo_hooks/$hook_name" ]; then
+  "$repo_hooks/$hook_name" "$@" || exit $?
+fi
+if [ "$hook_name" = "pre-push" ] && [ -z "$TOKENCHECKER_SKIP" ]; then
+  if [ "$(git config --get tokenchecker.enabled)" != "false" ]; then
+    TOKENCHECKER_SKIP=1 python3 "{script}" sync --hook || true
+  fi
+fi
+exit 0
+"""
+
+
+def tc_home():
+    return os.environ.get("TOKENCHECKER_HOME",
+                          os.path.join(os.path.expanduser("~"), ".tokenchecker"))
+
+
+def cmd_install_global(args):
+    home = tc_home()
+    hooks_dir = os.path.join(home, "hooks")
+    os.makedirs(hooks_dir, exist_ok=True)
+
+    script_dst = os.path.join(home, "tokenchecker.py")
+    src = os.path.realpath(__file__)
+    if os.path.realpath(script_dst) != src:
+        shutil.copy2(src, script_dst)
+        os.chmod(script_dst, 0o755)
+
+    dispatcher = DISPATCHER_TEMPLATE.format(marker=DISPATCHER_MARKER, script=script_dst)
+    for name in CLIENT_HOOKS:
+        hp = os.path.join(hooks_dir, name)
+        with open(hp, "w", encoding="utf-8") as fh:
+            fh.write(dispatcher)
+        os.chmod(hp, 0o755)
+
+    bin_dir = os.path.join(home, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    wrapper = os.path.join(bin_dir, "tokenchecker")
+    with open(wrapper, "w", encoding="utf-8") as fh:
+        fh.write(f"#!/bin/sh\nexec python3 \"{script_dst}\" \"$@\"\n")
+    os.chmod(wrapper, 0o755)
+
+    current = run(["git", "config", "--global", "--get", "core.hooksPath"],
+                  check=False).strip()
+    if current and os.path.realpath(current) != os.path.realpath(hooks_dir):
+        eprint(f"tokenchecker: core.hooksPath is already set globally to:\n"
+               f"  {current}\n"
+               f"Not overwriting it. To use tokenchecker globally, add this to "
+               f"your existing pre-push hook in that directory:\n"
+               f"  TOKENCHECKER_SKIP=1 python3 \"{script_dst}\" sync --hook || true")
+        return 1
+    if not current:
+        run(["git", "config", "--global", "core.hooksPath", hooks_dir])
+
+    print(f"tokenchecker installed globally:")
+    print(f"  - script:           {script_dst}")
+    print(f"  - CLI wrapper:      {wrapper}  (add {bin_dir} to PATH if you like)")
+    print(f"  - git hooks:        {hooks_dir}  (core.hooksPath, chains to each repo's own hooks)")
+    print()
+    print("Every `git push` in every repo now records AI token usage automatically.")
+    print("Notes:")
+    print("  - opt a repo out with:  git config tokenchecker.enabled false")
+    print("  - repos that set core.hooksPath locally (e.g. husky) bypass this;")
+    print("    add the sync line to their hook system or run `install` per-repo")
+    print("  - PR comments still need the workflow committed once per repo:")
+    print("    run `tokenchecker install` there and commit scripts/ + .github/")
+    return 0
 
 WORKFLOW_PATH = ".github/workflows/token-usage.yml"
 WORKFLOW_YAML = """\
@@ -943,6 +1118,7 @@ jobs:
             --branch "${{ github.head_ref }}" \\
             --refs-only --markdown > tokenchecker-report.md
           cat tokenchecker-report.md
+          cat tokenchecker-report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upsert PR comment
         uses: actions/github-script@v7
@@ -995,22 +1171,24 @@ def cmd_install(args):
         os.chmod(dst, 0o755)
         changed.append("scripts/tokenchecker.py")
 
-    # 2. pre-push hook
-    hooks_dir = git(repo, "rev-parse", "--git-path", "hooks").strip()
-    if not os.path.isabs(hooks_dir):
-        hooks_dir = os.path.join(repo, hooks_dir)
-    os.makedirs(hooks_dir, exist_ok=True)
-    hook_path = os.path.join(hooks_dir, "pre-push")
-    existing = ""
-    if os.path.exists(hook_path):
-        with open(hook_path, encoding="utf-8", errors="replace") as fh:
-            existing = fh.read()
-    if PRE_PUSH_MARKER not in existing:
-        content = existing if existing.strip() else "#!/bin/sh\n"
-        with open(hook_path, "w", encoding="utf-8") as fh:
-            fh.write(content.rstrip("\n") + "\n" + PRE_PUSH_BLOCK)
-        os.chmod(hook_path, 0o755)
-        changed.append(os.path.relpath(hook_path, repo) + " (local, not committed)")
+    # 2. pre-push hook. Always target the repo's OWN hooks dir — the effective
+    # dir (rev-parse --git-path hooks) may be a core.hooksPath shared across
+    # repos, which a per-repo install must never edit. When that shared dir is
+    # our global dispatcher, skip entirely: it already syncs on pre-push, and
+    # since it chains to repo hooks, adding one would sync twice per push.
+    effective_dir = git(repo, "rev-parse", "--git-path", "hooks").strip()
+    if not os.path.isabs(effective_dir):
+        effective_dir = os.path.join(repo, effective_dir)
+    effective_hook = os.path.join(effective_dir, "pre-push")
+    effective_text = ""
+    if os.path.exists(effective_hook):
+        with open(effective_hook, encoding="utf-8", errors="replace") as fh:
+            effective_text = fh.read()
+    if DISPATCHER_MARKER in effective_text:
+        skipped_hook = True
+    else:
+        skipped_hook = False
+        _install_repo_hook(repo, changed)
 
     # 3. GitHub workflow
     wf_path = os.path.join(repo, WORKFLOW_PATH)
@@ -1022,28 +1200,7 @@ def cmd_install(args):
 
     # 4. optional Claude Code SessionEnd hook (project settings)
     if args.claude_hook:
-        settings_path = os.path.join(repo, ".claude", "settings.json")
-        settings = {}
-        if os.path.exists(settings_path):
-            try:
-                with open(settings_path, encoding="utf-8") as fh:
-                    settings = json.load(fh)
-            except (json.JSONDecodeError, ValueError):
-                eprint(f"tokenchecker: {settings_path} is not valid JSON; skipping Claude hook")
-                settings = None
-        if settings is not None:
-            hooks = settings.setdefault("hooks", {})
-            session_end = hooks.setdefault("SessionEnd", [])
-            already = any(
-                CLAUDE_HOOK_COMMAND in json.dumps(entry) for entry in session_end)
-            if not already:
-                session_end.append(
-                    {"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})
-                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-                with open(settings_path, "w", encoding="utf-8") as fh:
-                    json.dump(settings, fh, indent=2)
-                    fh.write("\n")
-                changed.append(".claude/settings.json")
+        _install_claude_hook(repo, changed)
 
     if changed:
         print("tokenchecker installed. Created/updated:")
@@ -1051,13 +1208,66 @@ def cmd_install(args):
             print(f"  - {c}")
     else:
         print("tokenchecker: already installed, nothing to do")
+    if skipped_hook:
+        print("\nGlobal install detected (core.hooksPath dispatcher): skipped the "
+              "per-repo pre-push hook,\nsince the dispatcher already syncs on push.")
     print("\nNext steps:")
     print("  1. Commit scripts/tokenchecker.py and .github/workflows/token-usage.yml")
     print("  2. Every contributor runs: python3 scripts/tokenchecker.py install")
-    print("     (sets up their local pre-push hook)")
+    print("     (sets up their local pre-push hook; not needed with install --global)")
     print("  3. Token usage syncs automatically on every git push;")
     print("     run `python3 scripts/tokenchecker.py sync` to publish manually.")
     return 0
+
+
+def _install_repo_hook(repo, changed):
+    hooks_dir = os.path.join(git_dir(repo), "hooks")
+    os.makedirs(hooks_dir, exist_ok=True)
+    hook_path = os.path.join(hooks_dir, "pre-push")
+    existing = ""
+    if os.path.exists(hook_path):
+        with open(hook_path, encoding="utf-8", errors="replace") as fh:
+            existing = fh.read()
+    if PRE_PUSH_MARKER in existing:
+        # replace any stale block with the current one
+        pattern = re.compile(
+            re.escape(PRE_PUSH_MARKER) + r".*?" + re.escape(PRE_PUSH_END_MARKER) + r"\n?",
+            re.DOTALL)
+        updated = pattern.sub(PRE_PUSH_BLOCK.strip() + "\n", existing)
+        if updated != existing:
+            with open(hook_path, "w", encoding="utf-8") as fh:
+                fh.write(updated)
+            os.chmod(hook_path, 0o755)
+            changed.append(os.path.relpath(hook_path, repo) + " (hook block updated)")
+    else:
+        content = existing if existing.strip() else "#!/bin/sh\n"
+        with open(hook_path, "w", encoding="utf-8") as fh:
+            fh.write(content.rstrip("\n") + "\n" + PRE_PUSH_BLOCK)
+        os.chmod(hook_path, 0o755)
+        changed.append(os.path.relpath(hook_path, repo) + " (local, not committed)")
+
+
+def _install_claude_hook(repo, changed):
+    settings_path = os.path.join(repo, ".claude", "settings.json")
+    settings = {}
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as fh:
+                settings = json.load(fh)
+        except (json.JSONDecodeError, ValueError):
+            eprint(f"tokenchecker: {settings_path} is not valid JSON; skipping Claude hook")
+            return
+    hooks = settings.setdefault("hooks", {})
+    session_end = hooks.setdefault("SessionEnd", [])
+    if any(CLAUDE_HOOK_COMMAND in json.dumps(entry) for entry in session_end):
+        return
+    session_end.append(
+        {"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    changed.append(".claude/settings.json")
 
 
 def main(argv=None):
@@ -1071,6 +1281,7 @@ def main(argv=None):
         p.add_argument("--since", type=int, default=DEFAULT_SINCE_DAYS,
                        help=f"look back N days (default {DEFAULT_SINCE_DAYS})")
         p.add_argument("--remote", default="origin")
+        p.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)
 
     p = sub.add_parser("collect", help="scan local agent logs into the local store")
     common(p)
@@ -1095,11 +1306,19 @@ def main(argv=None):
                    help="ignore the local store; use only synced refs (for CI)")
     p.set_defaults(fn=cmd_report)
 
+    p = sub.add_parser("status", help="show when tokenchecker last ran and what is synced")
+    common(p)
+    p.add_argument("--log-lines", type=int, default=10, help="log lines to show (default 10)")
+    p.set_defaults(fn=cmd_status)
+
     p = sub.add_parser("install", help="vendor script, add pre-push hook + workflow")
     common(p)
     p.add_argument("--claude-hook", action="store_true",
                    help="also add a Claude Code SessionEnd hook to .claude/settings.json")
-    p.set_defaults(fn=cmd_install)
+    p.add_argument("--global", dest="global_install", action="store_true",
+                   help="install machine-wide: global git hooks dir (core.hooksPath) "
+                        "covering every repo, no per-repo setup needed")
+    p.set_defaults(fn=lambda a: cmd_install_global(a) if a.global_install else cmd_install(a))
 
     args = ap.parse_args(argv)
     return args.fn(args)

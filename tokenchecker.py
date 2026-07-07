@@ -1171,10 +1171,57 @@ def cmd_install(args):
         os.chmod(dst, 0o755)
         changed.append("scripts/tokenchecker.py")
 
-    # 2. pre-push hook
-    hooks_dir = git(repo, "rev-parse", "--git-path", "hooks").strip()
-    if not os.path.isabs(hooks_dir):
-        hooks_dir = os.path.join(repo, hooks_dir)
+    # 2. pre-push hook. Always target the repo's OWN hooks dir — the effective
+    # dir (rev-parse --git-path hooks) may be a core.hooksPath shared across
+    # repos, which a per-repo install must never edit. When that shared dir is
+    # our global dispatcher, skip entirely: it already syncs on pre-push, and
+    # since it chains to repo hooks, adding one would sync twice per push.
+    effective_dir = git(repo, "rev-parse", "--git-path", "hooks").strip()
+    if not os.path.isabs(effective_dir):
+        effective_dir = os.path.join(repo, effective_dir)
+    effective_hook = os.path.join(effective_dir, "pre-push")
+    effective_text = ""
+    if os.path.exists(effective_hook):
+        with open(effective_hook, encoding="utf-8", errors="replace") as fh:
+            effective_text = fh.read()
+    if DISPATCHER_MARKER in effective_text:
+        skipped_hook = True
+    else:
+        skipped_hook = False
+        _install_repo_hook(repo, changed)
+
+    # 3. GitHub workflow
+    wf_path = os.path.join(repo, WORKFLOW_PATH)
+    if not os.path.exists(wf_path):
+        os.makedirs(os.path.dirname(wf_path), exist_ok=True)
+        with open(wf_path, "w", encoding="utf-8") as fh:
+            fh.write(WORKFLOW_YAML)
+        changed.append(WORKFLOW_PATH)
+
+    # 4. optional Claude Code SessionEnd hook (project settings)
+    if args.claude_hook:
+        _install_claude_hook(repo, changed)
+
+    if changed:
+        print("tokenchecker installed. Created/updated:")
+        for c in changed:
+            print(f"  - {c}")
+    else:
+        print("tokenchecker: already installed, nothing to do")
+    if skipped_hook:
+        print("\nGlobal install detected (core.hooksPath dispatcher): skipped the "
+              "per-repo pre-push hook,\nsince the dispatcher already syncs on push.")
+    print("\nNext steps:")
+    print("  1. Commit scripts/tokenchecker.py and .github/workflows/token-usage.yml")
+    print("  2. Every contributor runs: python3 scripts/tokenchecker.py install")
+    print("     (sets up their local pre-push hook; not needed with install --global)")
+    print("  3. Token usage syncs automatically on every git push;")
+    print("     run `python3 scripts/tokenchecker.py sync` to publish manually.")
+    return 0
+
+
+def _install_repo_hook(repo, changed):
+    hooks_dir = os.path.join(git_dir(repo), "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
     hook_path = os.path.join(hooks_dir, "pre-push")
     existing = ""
@@ -1199,52 +1246,28 @@ def cmd_install(args):
         os.chmod(hook_path, 0o755)
         changed.append(os.path.relpath(hook_path, repo) + " (local, not committed)")
 
-    # 3. GitHub workflow
-    wf_path = os.path.join(repo, WORKFLOW_PATH)
-    if not os.path.exists(wf_path):
-        os.makedirs(os.path.dirname(wf_path), exist_ok=True)
-        with open(wf_path, "w", encoding="utf-8") as fh:
-            fh.write(WORKFLOW_YAML)
-        changed.append(WORKFLOW_PATH)
 
-    # 4. optional Claude Code SessionEnd hook (project settings)
-    if args.claude_hook:
-        settings_path = os.path.join(repo, ".claude", "settings.json")
-        settings = {}
-        if os.path.exists(settings_path):
-            try:
-                with open(settings_path, encoding="utf-8") as fh:
-                    settings = json.load(fh)
-            except (json.JSONDecodeError, ValueError):
-                eprint(f"tokenchecker: {settings_path} is not valid JSON; skipping Claude hook")
-                settings = None
-        if settings is not None:
-            hooks = settings.setdefault("hooks", {})
-            session_end = hooks.setdefault("SessionEnd", [])
-            already = any(
-                CLAUDE_HOOK_COMMAND in json.dumps(entry) for entry in session_end)
-            if not already:
-                session_end.append(
-                    {"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})
-                os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-                with open(settings_path, "w", encoding="utf-8") as fh:
-                    json.dump(settings, fh, indent=2)
-                    fh.write("\n")
-                changed.append(".claude/settings.json")
-
-    if changed:
-        print("tokenchecker installed. Created/updated:")
-        for c in changed:
-            print(f"  - {c}")
-    else:
-        print("tokenchecker: already installed, nothing to do")
-    print("\nNext steps:")
-    print("  1. Commit scripts/tokenchecker.py and .github/workflows/token-usage.yml")
-    print("  2. Every contributor runs: python3 scripts/tokenchecker.py install")
-    print("     (sets up their local pre-push hook)")
-    print("  3. Token usage syncs automatically on every git push;")
-    print("     run `python3 scripts/tokenchecker.py sync` to publish manually.")
-    return 0
+def _install_claude_hook(repo, changed):
+    settings_path = os.path.join(repo, ".claude", "settings.json")
+    settings = {}
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path, encoding="utf-8") as fh:
+                settings = json.load(fh)
+        except (json.JSONDecodeError, ValueError):
+            eprint(f"tokenchecker: {settings_path} is not valid JSON; skipping Claude hook")
+            return
+    hooks = settings.setdefault("hooks", {})
+    session_end = hooks.setdefault("SessionEnd", [])
+    if any(CLAUDE_HOOK_COMMAND in json.dumps(entry) for entry in session_end):
+        return
+    session_end.append(
+        {"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})
+    os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+    with open(settings_path, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    changed.append(".claude/settings.json")
 
 
 def main(argv=None):

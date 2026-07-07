@@ -1,0 +1,39 @@
+# Monthly refresh of the embedded price fallback table from LiteLLM's
+# community pricing data. Opens a PR only when prices actually drifted.
+# One-time repo setting required: Settings -> Actions -> General ->
+# "Allow GitHub Actions to create and approve pull requests".
+name: Update embedded prices
+
+on:
+  schedule:
+    - cron: "17 6 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Regenerate embedded prices
+        run: |
+          python3 scripts/update_prices.py
+          cp tokenchecker.py scripts/tokenchecker.py
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "update embedded model prices from LiteLLM"
+          title: "Update embedded model prices"
+          body: |
+            Automated monthly refresh of the `EMBEDDED_PRICES` fallback table
+            from LiteLLM's `model_prices_and_context_window.json`.
+
+            Reports prefer live/cached prices, so this only affects offline use —
+            but review the diff for surprising changes before merging.
+          branch: update-embedded-prices
+          delete-branch: true

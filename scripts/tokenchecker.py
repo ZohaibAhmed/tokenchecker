@@ -16,7 +16,7 @@ Commands:
   install   vendor this script, add pre-push hook + GitHub workflow
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import getpass
@@ -221,6 +221,332 @@ def dedup(records):
         if prev is None or r.get("total", 0) > prev.get("total", 0):
             by_id[rid] = r
     return list(by_id.values())
+
+
+# ----------------------------------------------------------------- pricing
+# Costs are estimates at API list price (subscriptions bill differently) and
+# are computed at report time, never stored in records, so a price update
+# retroactively corrects every report. Resolution order:
+#   1. TOKENCHECKER_PRICES=<file>  (team-pinned rates)
+#   2. cached fetch of LiteLLM's community-maintained price table (7-day TTL)
+#   3. EMBEDDED_PRICES below (refreshed monthly by scripts/update_prices.py)
+# All prices are USD per million tokens: {input, cache_read, cache_write, output}.
+
+PRICES_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/main/"
+              "model_prices_and_context_window.json")
+PRICES_CACHE_TTL_DAYS = 7
+
+# >>> embedded prices (auto-generated, run scripts/update_prices.py) >>>
+EMBEDDED_PRICES_DATE = "2026-07-07"
+EMBEDDED_PRICES = {
+    "claude-3-5-haiku": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 5},
+    "claude-3-5-haiku@20241022": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 5},
+    "claude-3-5-sonnet": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-3-5-sonnet-20241022": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-3-5-sonnet@20240620": {"input": 3, "cache_read": 0, "cache_write": 0, "output": 15},
+    "claude-3-7-sonnet": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-3-7-sonnet-20250219": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-3-7-sonnet-latest": {"input": 3.3, "cache_read": 0.33, "cache_write": 0, "output": 16.5},
+    "claude-3-7-sonnet@20250219": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-3-haiku": {"input": 0.25, "cache_read": 0.03, "cache_write": 0.3, "output": 1.25},
+    "claude-3-haiku-20240307": {"input": 0.25, "cache_read": 0.03, "cache_write": 0.3, "output": 1.25},
+    "claude-3-haiku@20240307": {"input": 0.25, "cache_read": 0, "cache_write": 0, "output": 1.25},
+    "claude-3-opus": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-3-opus-20240229": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-3-opus@20240229": {"input": 15, "cache_read": 0, "cache_write": 0, "output": 75},
+    "claude-3-sonnet": {"input": 3, "cache_read": 0, "cache_write": 0, "output": 15},
+    "claude-3-sonnet@20240229": {"input": 3, "cache_read": 0, "cache_write": 0, "output": 15},
+    "claude-3.5-haiku": {"input": 0.8, "cache_read": 0.08, "cache_write": 1, "output": 4},
+    "claude-3.5-sonnet": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-3.7-sonnet": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-4-opus": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-4-opus-20250514": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-4-sonnet": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-4-sonnet-20250514": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-4.5-haiku": {"input": 1, "cache_read": 0, "cache_write": 0, "output": 5},
+    "claude-4.5-sonnet": {"input": 3, "cache_read": 0, "cache_write": 0, "output": 15},
+    "claude-fable-5": {"input": 10, "cache_read": 1, "cache_write": 12.5, "output": 50},
+    "claude-fable-5@default": {"input": 10, "cache_read": 1, "cache_write": 12.5, "output": 50},
+    "claude-haiku-4-5": {"input": 1, "cache_read": 0.1, "cache_write": 1.25, "output": 5},
+    "claude-haiku-4-5-20251001": {"input": 1, "cache_read": 0.1, "cache_write": 1.25, "output": 5},
+    "claude-haiku-4-5@20251001": {"input": 1, "cache_read": 0.1, "cache_write": 1.25, "output": 5},
+    "claude-haiku-4.5": {"input": 1, "cache_read": 0.1, "cache_write": 1.25, "output": 5},
+    "claude-opus-4": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-opus-4-1": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-opus-4-1-20250805": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-opus-4-1@20250805": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-opus-4-20250514": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-opus-4-5": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-5-20251101": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-5@20251101": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-6": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-6-20260205": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-6@default": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-7": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-7-20260416": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-7@default": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-8": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4-8@default": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4.1": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-opus-4.5": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4.6": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4.7": {"input": 5, "cache_read": 0.5, "cache_write": 6.25, "output": 25},
+    "claude-opus-4@20250514": {"input": 15, "cache_read": 1.5, "cache_write": 18.75, "output": 75},
+    "claude-sonnet-4": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4-20250514": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4-5": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4-5-20250929": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4-5-20250929-v1:0": {"input": 3.6, "cache_read": 0.36, "cache_write": 4.5, "output": 18},
+    "claude-sonnet-4-5@20250929": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4-6": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4-6@default": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4.5": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4.6": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-4@20250514": {"input": 3, "cache_read": 0.3, "cache_write": 3.75, "output": 15},
+    "claude-sonnet-5": {"input": 2, "cache_read": 0.2, "cache_write": 2.5, "output": 10},
+    "claude-sonnet-5@default": {"input": 2, "cache_read": 0.2, "cache_write": 2.5, "output": 10},
+    "codex-mini": {"input": 1.5, "cache_read": 0.375, "cache_write": 0, "output": 6},
+    "codex-mini-latest": {"input": 1.5, "cache_read": 0.375, "cache_write": 0, "output": 6},
+    "gemini-2.0-flash": {"input": 0.1, "cache_read": 0.025, "cache_write": 0, "output": 0.4},
+    "gemini-2.0-flash-001": {"input": 0.15, "cache_read": 0.0375, "cache_write": 0, "output": 0.6},
+    "gemini-2.0-flash-lite": {"input": 0.075, "cache_read": 0.01875, "cache_write": 0, "output": 0.3},
+    "gemini-2.0-flash-lite-001": {"input": 0.075, "cache_read": 0.01875, "cache_write": 0, "output": 0.3},
+    "gemini-2.5-computer-use-preview-10-2025": {"input": 1.25, "cache_read": 0, "cache_write": 0, "output": 10},
+    "gemini-2.5-flash": {"input": 0.3, "cache_read": 0.03, "cache_write": 0, "output": 2.5},
+    "gemini-2.5-flash-lite": {"input": 0.1, "cache_read": 0.01, "cache_write": 0, "output": 0.4},
+    "gemini-2.5-flash-lite-preview-06-17": {"input": 0.1, "cache_read": 0.025, "cache_write": 0, "output": 0.4},
+    "gemini-2.5-flash-lite-preview-09-2025": {"input": 0.1, "cache_read": 0.01, "cache_write": 0, "output": 0.4},
+    "gemini-2.5-flash-preview-09-2025": {"input": 0.3, "cache_read": 0.075, "cache_write": 0, "output": 2.5},
+    "gemini-2.5-pro": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gemini-3-flash-preview": {"input": 0.5, "cache_read": 0.05, "cache_write": 0, "output": 3},
+    "gemini-3-pro": {"input": 2, "cache_read": 0, "cache_write": 0, "output": 12},
+    "gemini-3-pro-preview": {"input": 2, "cache_read": 0.2, "cache_write": 0, "output": 12},
+    "gemini-3.1-flash-lite": {"input": 0.25, "cache_read": 0.025, "cache_write": 0, "output": 1.5},
+    "gemini-3.1-flash-lite-preview": {"input": 0.25, "cache_read": 0.025, "cache_write": 0, "output": 1.5},
+    "gemini-3.1-flash-live-preview": {"input": 0.75, "cache_read": 0, "cache_write": 0, "output": 4.5},
+    "gemini-3.1-pro-preview": {"input": 2, "cache_read": 0.2, "cache_write": 0, "output": 12},
+    "gemini-3.1-pro-preview-customtools": {"input": 2, "cache_read": 0.2, "cache_write": 0, "output": 12},
+    "gemini-3.5-flash": {"input": 1.5, "cache_read": 0.15, "cache_write": 0, "output": 9},
+    "gpt-4": {"input": 30, "cache_read": 0, "cache_write": 0, "output": 60},
+    "gpt-4-0125-preview": {"input": 10, "cache_read": 0, "cache_write": 0, "output": 30},
+    "gpt-4-0314": {"input": 30, "cache_read": 0, "cache_write": 0, "output": 60},
+    "gpt-4-0613": {"input": 30, "cache_read": 0, "cache_write": 0, "output": 60},
+    "gpt-4-1106-preview": {"input": 10, "cache_read": 0, "cache_write": 0, "output": 30},
+    "gpt-4-32k": {"input": 60, "cache_read": 0, "cache_write": 0, "output": 120},
+    "gpt-4-32k-0613": {"input": 60, "cache_read": 0, "cache_write": 0, "output": 120},
+    "gpt-4-turbo": {"input": 10, "cache_read": 0, "cache_write": 0, "output": 30},
+    "gpt-4-turbo-2024-04-09": {"input": 10, "cache_read": 0, "cache_write": 0, "output": 30},
+    "gpt-4-turbo-preview": {"input": 10, "cache_read": 0, "cache_write": 0, "output": 30},
+    "gpt-4-turbo-vision-preview": {"input": 10, "cache_read": 0, "cache_write": 0, "output": 30},
+    "gpt-4.1": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8},
+    "gpt-4.1-2025-04-14": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8},
+    "gpt-4.1-mini": {"input": 0.4, "cache_read": 0.1, "cache_write": 0, "output": 1.6},
+    "gpt-4.1-mini-2025-04-14": {"input": 0.4, "cache_read": 0.1, "cache_write": 0, "output": 1.6},
+    "gpt-4.1-nano": {"input": 0.1, "cache_read": 0.025, "cache_write": 0, "output": 0.4},
+    "gpt-4.1-nano-2025-04-14": {"input": 0.1, "cache_read": 0.025, "cache_write": 0, "output": 0.4},
+    "gpt-4.5-preview": {"input": 75, "cache_read": 37.5, "cache_write": 0, "output": 150},
+    "gpt-4o": {"input": 2.5, "cache_read": 1.25, "cache_write": 0, "output": 10},
+    "gpt-4o-2024-05-13": {"input": 5, "cache_read": 0, "cache_write": 0, "output": 15},
+    "gpt-4o-2024-08-06": {"input": 2.75, "cache_read": 1.375, "cache_write": 0, "output": 11},
+    "gpt-4o-2024-11-20": {"input": 2.75, "cache_read": 0, "cache_write": 1.38, "output": 11},
+    "gpt-4o-mini": {"input": 0.165, "cache_read": 0.075, "cache_write": 0, "output": 0.66},
+    "gpt-4o-mini-2024-07-18": {"input": 0.165, "cache_read": 0.083, "cache_write": 0, "output": 0.66},
+    "gpt-5": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5-2025-08-07": {"input": 1.375, "cache_read": 0.1375, "cache_write": 0, "output": 11},
+    "gpt-5-chat": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5-codex": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5-mini": {"input": 0.25, "cache_read": 0.025, "cache_write": 0, "output": 2},
+    "gpt-5-mini-2025-08-07": {"input": 0.275, "cache_read": 0.0275, "cache_write": 0, "output": 2.2},
+    "gpt-5-nano": {"input": 0.05, "cache_read": 0.005, "cache_write": 0, "output": 0.4},
+    "gpt-5-nano-2025-08-07": {"input": 0.055, "cache_read": 0.0055, "cache_write": 0, "output": 0.44},
+    "gpt-5-pro": {"input": 15, "cache_read": 0, "cache_write": 0, "output": 120},
+    "gpt-5-pro-2025-10-06": {"input": 15, "cache_read": 0, "cache_write": 0, "output": 120},
+    "gpt-5.1": {"input": 1.38, "cache_read": 0.14, "cache_write": 0, "output": 11},
+    "gpt-5.1-2025-11-13": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5.1-chat": {"input": 1.38, "cache_read": 0.14, "cache_write": 0, "output": 11},
+    "gpt-5.1-chat-2025-11-13": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5.1-codex": {"input": 1.38, "cache_read": 0.14, "cache_write": 0, "output": 11},
+    "gpt-5.1-codex-2025-11-13": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5.1-codex-max": {"input": 1.25, "cache_read": 0.125, "cache_write": 0, "output": 10},
+    "gpt-5.1-codex-mini": {"input": 0.275, "cache_read": 0.028, "cache_write": 0, "output": 2.2},
+    "gpt-5.1-codex-mini-2025-11-13": {"input": 0.25, "cache_read": 0.025, "cache_write": 0, "output": 2},
+    "gpt-5.2": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.2-2025-12-11": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.2-chat": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.2-chat-2025-12-11": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.2-codex": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.2-pro": {"input": 21, "cache_read": 0, "cache_write": 0, "output": 168},
+    "gpt-5.2-pro-2025-12-11": {"input": 21, "cache_read": 0, "cache_write": 0, "output": 168},
+    "gpt-5.3-chat": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.3-codex": {"input": 1.75, "cache_read": 0.175, "cache_write": 0, "output": 14},
+    "gpt-5.4": {"input": 2.5, "cache_read": 0.25, "cache_write": 0, "output": 15},
+    "gpt-5.4-2026-03-05": {"input": 2.5, "cache_read": 0.25, "cache_write": 0, "output": 15},
+    "gpt-5.4-mini": {"input": 0.75, "cache_read": 0.075, "cache_write": 0, "output": 4.5},
+    "gpt-5.4-mini-2026-03-17": {"input": 0.75, "cache_read": 0.075, "cache_write": 0, "output": 4.5},
+    "gpt-5.4-nano": {"input": 0.2, "cache_read": 0.02, "cache_write": 0, "output": 1.25},
+    "gpt-5.4-nano-2026-03-17": {"input": 0.2, "cache_read": 0.02, "cache_write": 0, "output": 1.25},
+    "gpt-5.4-pro": {"input": 30, "cache_read": 3, "cache_write": 0, "output": 180},
+    "gpt-5.4-pro-2026-03-05": {"input": 30, "cache_read": 3, "cache_write": 0, "output": 180},
+    "gpt-5.5": {"input": 5, "cache_read": 0.5, "cache_write": 0, "output": 30},
+    "gpt-5.5-2026-04-23": {"input": 5, "cache_read": 0.5, "cache_write": 0, "output": 30},
+    "gpt-5.5-pro": {"input": 30, "cache_read": 3, "cache_write": 0, "output": 180},
+    "gpt-5.5-pro-2026-04-23": {"input": 30, "cache_read": 3, "cache_write": 0, "output": 180},
+    "o3": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8},
+    "o3-2025-04-16": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8},
+    "o3-deep-research": {"input": 10, "cache_read": 2.5, "cache_write": 0, "output": 40},
+    "o3-deep-research-2025-06-26": {"input": 10, "cache_read": 2.5, "cache_write": 0, "output": 40},
+    "o3-mini": {"input": 1.1, "cache_read": 0.55, "cache_write": 0, "output": 4.4},
+    "o3-mini-2025-01-31": {"input": 1.21, "cache_read": 0.605, "cache_write": 0, "output": 4.84},
+    "o3-mini-high": {"input": 1.1, "cache_read": 0, "cache_write": 0, "output": 4.4},
+    "o3-pro": {"input": 20, "cache_read": 0, "cache_write": 0, "output": 80},
+    "o3-pro-2025-06-10": {"input": 20, "cache_read": 0, "cache_write": 0, "output": 80},
+    "o4-mini": {"input": 1.1, "cache_read": 0.275, "cache_write": 0, "output": 4.4},
+    "o4-mini-2025-04-16": {"input": 1.1, "cache_read": 0.275, "cache_write": 0, "output": 4.4},
+    "o4-mini-deep-research": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8},
+    "o4-mini-deep-research-2025-06-26": {"input": 2, "cache_read": 0.5, "cache_write": 0, "output": 8},
+}
+# <<< embedded prices <<<
+
+
+def parse_litellm_prices(data):
+    """LiteLLM's per-token JSON -> {model: {input, cache_read, cache_write, output}} $/MTok."""
+    prices = {}
+    if not isinstance(data, dict):
+        raise ValueError("price data is not a JSON object")
+    for key, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        inp = info.get("input_cost_per_token")
+        out = info.get("output_cost_per_token")
+        if not isinstance(inp, (int, float)) or not isinstance(out, (int, float)):
+            continue
+        entry = {
+            "input": inp * 1e6,
+            "cache_read": (info.get("cache_read_input_token_cost") or 0) * 1e6,
+            "cache_write": (info.get("cache_creation_input_token_cost") or 0) * 1e6,
+            "output": out * 1e6,
+        }
+        if any(not (0 <= v < 10000) for v in entry.values()):
+            continue
+        name = key.split("/")[-1].strip().lower()
+        if not name:
+            continue
+        # the same basename appears under several providers; keep the entry
+        # with the most complete pricing (some lack cache rates)
+        prev = prices.get(name)
+        if prev is None or (sum(1 for v in entry.values() if v)
+                            > sum(1 for v in prev.values() if v)):
+            prices[name] = entry
+    if len(prices) < 50:
+        raise ValueError(f"price data looks malformed ({len(prices)} usable models)")
+    return prices
+
+
+def fetch_live_prices(timeout=10):
+    import urllib.request
+    req = urllib.request.Request(PRICES_URL, headers={"User-Agent": "tokenchecker"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return parse_litellm_prices(json.loads(resp.read().decode("utf-8")))
+
+
+def prices_cache_path():
+    return os.path.join(tc_home(), "prices.json")
+
+
+def resolve_prices():
+    """-> (prices dict or {}, source label, source date) trying override/live/cache/embedded."""
+    override = os.environ.get("TOKENCHECKER_PRICES")
+    if override:
+        try:
+            with open(override, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and "prices" in data:
+                return data["prices"], "custom", data.get("date", "")
+            try:
+                return parse_litellm_prices(data), "custom", ""
+            except ValueError:
+                return data, "custom", ""  # already our {model: {...}} schema
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            eprint(f"tokenchecker: could not read TOKENCHECKER_PRICES ({exc}); "
+                   "falling back")
+    cached = None
+    cache_file = prices_cache_path()
+    try:
+        with open(cache_file, encoding="utf-8") as fh:
+            cached = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        cached = None
+    now = datetime.now(timezone.utc)
+    if cached and cached.get("date"):
+        age = now - datetime.fromisoformat(cached["date"]).replace(tzinfo=timezone.utc)
+        if age < timedelta(days=PRICES_CACHE_TTL_DAYS):
+            return cached["prices"], "cached", cached["date"][:10]
+    if not os.environ.get("TOKENCHECKER_NO_NETWORK"):
+        try:
+            prices = fetch_live_prices()
+            try:
+                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                with open(cache_file, "w", encoding="utf-8") as fh:
+                    json.dump({"date": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                               "prices": prices}, fh)
+            except OSError:
+                pass
+            return prices, "live", now.strftime("%Y-%m-%d")
+        except Exception:
+            pass  # offline or upstream broken -> stale cache or embedded
+    if cached and cached.get("prices"):
+        return cached["prices"], "cached (stale)", (cached.get("date") or "")[:10]
+    return EMBEDDED_PRICES, "built-in", EMBEDDED_PRICES_DATE
+
+
+def _model_candidates(model):
+    """Normalized lookup keys for a raw model id, most specific first."""
+    m = (model or "").strip().lower()
+    if not m:
+        return []
+    out = [m]
+    # Cursor-style "claude-4.5-sonnet" -> canonical "claude-sonnet-4-5"
+    mm = re.match(r"^claude-?(\d+(?:\.\d+)?)-(sonnet|opus|haiku)$", m)
+    if mm:
+        out.append(f"claude-{mm.group(2)}-{mm.group(1).replace('.', '-')}")
+    base = re.sub(r"[-@]20\d{6}$", "", m)  # strip date snapshot suffixes
+    if base not in out:
+        out.append(base)
+    parts = base.split("-")
+    while len(parts) > 2:  # progressively coarser family prefixes
+        parts = parts[:-1]
+        out.append("-".join(parts))
+    return out
+
+
+def lookup_price(model, prices):
+    if not prices:
+        return None
+    for cand in _model_candidates(model):
+        p = prices.get(cand)
+        if p:
+            return p
+    return None
+
+
+def cost_of(tokens, price):
+    """tokens: dict with input/cache_read/cache_write/output counts -> $ or None."""
+    if price is None:
+        return None
+    return (tokens.get("input", 0) * price.get("input", 0)
+            + tokens.get("cache_read", 0) * price.get("cache_read", 0)
+            + tokens.get("cache_write", 0) * price.get("cache_write", 0)
+            + tokens.get("output", 0) * price.get("output", 0)) / 1e6
+
+
+def fmt_cost(c):
+    if c is None:
+        return "—"
+    if c >= 100:
+        return f"${c:,.0f}"
+    if c >= 0.01 or c == 0:
+        return f"${c:,.2f}"
+    return "<$0.01"
 
 
 # ------------------------------------------------------------ Claude Code
@@ -734,7 +1060,7 @@ def fmt_n(n):
     return f"{n:,}"
 
 
-def render_markdown(records, branch):
+def render_markdown(records, branch, prices=None, price_source=("built-in", "")):
     lines = [COMMENT_MARKER, f"## 🤖 AI token usage for `{branch}`", ""]
     if not records:
         lines.append("_No AI agent token usage has been recorded for this branch yet._")
@@ -744,22 +1070,30 @@ def render_markdown(records, branch):
         return "\n".join(lines) + "\n"
     groups = summarize(records)
     machines = sorted({r.get("machine", "?") for r in records})
-    lines.append("| Tool | Model | Sessions | Msgs | Input | Cache read | Cache write | Output | Total |")
-    lines.append("|---|---|--:|--:|--:|--:|--:|--:|--:|")
+    lines.append("| Tool | Model | Sessions | Msgs | Input | Cache read | Cache write | Output | Total | Est. cost |")
+    lines.append("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|")
     grand = {"input": 0, "cache_read": 0, "cache_write": 0, "output": 0, "total": 0, "msgs": 0}
     grand_sessions = 0
+    grand_cost = 0.0
+    unpriced = set()
     for (tool, model), g in sorted(groups.items(), key=lambda kv: -kv[1]["total"]):
+        cost = cost_of(g, lookup_price(model, prices))
+        if cost is None:
+            unpriced.add(model)
+        else:
+            grand_cost += cost
         lines.append(
             f"| {tool} | `{model}` | {len(g['sessions'])} | {g['msgs']} "
             f"| {fmt_n(g['input'])} | {fmt_n(g['cache_read'])} | {fmt_n(g['cache_write'])} "
-            f"| {fmt_n(g['output'])} | **{fmt_n(g['total'])}** |")
+            f"| {fmt_n(g['output'])} | **{fmt_n(g['total'])}** | {fmt_cost(cost)} |")
         grand_sessions += len(g["sessions"])
         for f in grand:
             grand[f] += g[f] if f != "msgs" else g["msgs"]
+    approx = "≈" if unpriced else ""
     lines.append(
         f"| **All** | | {grand_sessions} | {grand['msgs']} "
         f"| {fmt_n(grand['input'])} | {fmt_n(grand['cache_read'])} | {fmt_n(grand['cache_write'])} "
-        f"| {fmt_n(grand['output'])} | **{fmt_n(grand['total'])}** |")
+        f"| {fmt_n(grand['output'])} | **{fmt_n(grand['total'])}** | **{approx}{fmt_cost(grand_cost)}** |")
     lines.append("")
     per_machine = {}
     for r in records:
@@ -779,13 +1113,21 @@ def render_markdown(records, branch):
     if ts_values:
         span = f" between {iso(ts_values[0])[:10]} and {iso(ts_values[-1])[:10]}"
     lines.append(
-        f"_{fmt_n(grand['total'])} tokens across {len(records)} messages from "
-        f"{len(machines)} machine(s){span}. Cache reads are counted separately "
-        f"from fresh input tokens._")
+        f"_{fmt_n(grand['total'])} tokens ≈ {fmt_cost(grand_cost)} across {len(records)} "
+        f"messages from {len(machines)} machine(s){span}. Cache reads are counted "
+        f"separately from fresh input tokens._")
+    label, date = price_source
+    provenance = f"prices: {label}" + (f" ({date})" if date else "")
+    footnote = (f"_Est. cost is at API list price — subscription plans "
+                f"(Claude Max, Cursor Pro, …) bill differently. {provenance}._")
+    if unpriced:
+        footnote += f"\n_No pricing found for: {', '.join(f'`{m}`' for m in sorted(unpriced))}._"
+    lines.append("")
+    lines.append(footnote)
     return "\n".join(lines) + "\n"
 
 
-def render_text(records, branch=None):
+def render_text(records, branch=None, prices=None, price_source=("built-in", "")):
     if branch:
         header = f"Token usage for branch '{branch}'"
     else:
@@ -794,24 +1136,40 @@ def render_text(records, branch=None):
     branches = sorted({r.get("branch", "(unknown)") for r in records})
     if branch:
         branches = [branch]
+    any_unpriced = False
     for b in branches:
         subset = [r for r in records if r.get("branch") == b]
         if not subset:
             continue
         total = sum(int(r.get("total", 0)) for r in subset)
+        groups = summarize(subset)
+        costs = {key: cost_of(g, lookup_price(key[1], prices)) for key, g in groups.items()}
+        branch_cost = sum(c for c in costs.values() if c is not None)
+        unpriced = any(c is None for c in costs.values())
+        any_unpriced = any_unpriced or unpriced
+        approx = "≥" if unpriced else "≈"
         if not branch:
-            out.append(f"\n{b}: {fmt_n(total)} tokens")
-        for (tool, model), g in sorted(summarize(subset).items(), key=lambda kv: -kv[1]["total"]):
+            out.append(f"\n{b}: {fmt_n(total)} tokens {approx} {fmt_cost(branch_cost)}")
+        for key, g in sorted(groups.items(), key=lambda kv: -kv[1]["total"]):
+            tool, model = key
             out.append(
                 f"  {tool:12s} {model:40s} sessions={len(g['sessions']):<3d} "
                 f"in={fmt_n(g['input']):>12s} cache_r={fmt_n(g['cache_read']):>13s} "
                 f"cache_w={fmt_n(g['cache_write']):>12s} out={fmt_n(g['output']):>11s} "
-                f"total={fmt_n(g['total']):>13s}")
+                f"total={fmt_n(g['total']):>13s}  cost={fmt_cost(costs[key]):>9s}")
         if branch:
             out.append(f"  {'TOTAL':12s} {'':40s} {'':13s} "
-                       f"{'':16s} {'':21s} {'':20s} total={fmt_n(total):>13s}")
+                       f"{'':16s} {'':21s} {'':20s} total={fmt_n(total):>13s}  "
+                       f"cost={approx}{fmt_cost(branch_cost)}")
     if len(out) <= 2:
         out.append("(no records)")
+    else:
+        label, date = price_source
+        note = f"\nEst. cost at API list price (prices: {label}"
+        note += f" {date})" if date else ")"
+        if any_unpriced:
+            note += "; models without pricing shown as — and excluded from totals"
+        out.append(note)
     return "\n".join(out) + "\n"
 
 
@@ -844,7 +1202,8 @@ def cmd_collect(args):
         counts[name] = len(recs)
         collected.extend(recs)
     if args.dry_run:
-        print(render_text(dedup(collected)))
+        prices, label, date = resolve_prices()
+        print(render_text(dedup(collected), prices=prices, price_source=(label, date)))
         if not args.quiet:
             eprint("dry run — nothing written. per-source records: "
                    + ", ".join(f"{k}={v}" for k, v in counts.items()))
@@ -926,10 +1285,13 @@ def cmd_report(args):
     records = aggregate(records, branch=args.branch)
     if args.json:
         print(json.dumps(records, indent=2))
-    elif args.markdown:
-        print(render_markdown(records, args.branch or "(all branches)"), end="")
+        return 0
+    prices, label, date = resolve_prices()
+    if args.markdown:
+        print(render_markdown(records, args.branch or "(all branches)",
+                              prices, (label, date)), end="")
     else:
-        print(render_text(records, args.branch), end="")
+        print(render_text(records, args.branch, prices, (label, date)), end="")
     return 0
 
 

@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-tokenchecker.py
-tokenchecker.egg-info/PKG-INFO
-tokenchecker.egg-info/SOURCES.txt
-tokenchecker.egg-info/dependency_links.txt
-tokenchecker.egg-info/entry_points.txt
-tokenchecker.egg-info/top_level.txt

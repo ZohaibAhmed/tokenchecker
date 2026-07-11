@@ -13,10 +13,11 @@ Commands:
   push      publish this machine's records to origin (refs/token-usage/<id>)
   sync      collect + push
   report    aggregate records (local + all synced machines) per branch
-  install   vendor this script, add pre-push hook + GitHub workflow
+  comment   post/update the usage comment on the branch's open PR (via gh)
+  install   add pre-push hook + minimal GitHub workflow (--vendor to embed)
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import argparse
 import getpass
@@ -1271,7 +1272,105 @@ def cmd_sync(args):
     rc = cmd_collect(args)
     if rc != 0:
         return rc
-    return cmd_push(args)
+    rc = cmd_push(args)
+    if rc != 0:
+        return rc
+    if getattr(args, "hook", False):
+        _maybe_comment_from_hook(args)
+    return 0
+
+
+# ------------------------------------------------------------- PR comments
+
+
+def find_open_pr(repo, branch):
+    out = run(["gh", "pr", "view", branch, "--json", "number,state"],
+              cwd=repo, check=False)
+    try:
+        d = json.loads(out or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return d.get("number") if d.get("state") == "OPEN" else None
+
+
+def upsert_pr_comment(repo, pr, body):
+    """Create or update the sticky report comment; returns 'created'/'updated'."""
+    existing = run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{pr}/comments",
+         "--paginate", "--jq",
+         f'.[] | select(.body | contains("{COMMENT_MARKER}")) | .id'],
+        cwd=repo, check=False).split()
+    payload = json.dumps({"body": body})
+    if existing:
+        run(["gh", "api", "-X", "PATCH",
+             f"repos/{{owner}}/{{repo}}/issues/comments/{existing[0]}",
+             "--input", "-"], cwd=repo, input_=payload)
+        return "updated"
+    run(["gh", "api", "-X", "POST",
+         f"repos/{{owner}}/{{repo}}/issues/{pr}/comments",
+         "--input", "-"], cwd=repo, input_=payload)
+    return "created"
+
+
+def cmd_comment(args):
+    repo = repo_root(args.repo)
+    if not repo:
+        eprint("tokenchecker: not inside a git repository")
+        return 1
+    if not shutil.which("gh"):
+        eprint("tokenchecker: the `gh` CLI is required to post PR comments "
+               "(https://cli.github.com), or use the CI workflow instead")
+        return 1
+    hook_mode = getattr(args, "hook", False)
+    branch = args.branch or git(repo, "rev-parse", "--abbrev-ref", "HEAD",
+                                check=False).strip()
+    if not branch or branch == "HEAD":
+        eprint("tokenchecker: cannot determine the branch to report on")
+        return 1
+    pr = args.pr or find_open_pr(repo, branch)
+    if not pr:
+        if not args.quiet and not hook_mode:
+            print(f"tokenchecker: no open PR found for branch '{branch}'")
+        return 0
+    git(repo, "fetch", args.remote, f"+{REF_PREFIX}*:{REF_PREFIX}*", check=False)
+    records = [] if args.refs_only else load_local(repo)
+    for ref in list_usage_refs(repo):
+        records.extend(read_ref_records(repo, ref))
+    records = aggregate(records, branch=branch)
+    prices, label, date = resolve_prices()
+    body = render_markdown(records, branch, prices, (label, date))
+    action = upsert_pr_comment(repo, pr, body)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+        except OSError:
+            pass
+    log_event(repo, f"comment: {action} on PR #{pr} for '{branch}'")
+    if not args.quiet:
+        print(f"tokenchecker: {action} token-usage comment on PR #{pr}")
+    return 0
+
+
+def _maybe_comment_from_hook(args):
+    """After a hook-mode sync, refresh the PR comment for the current branch.
+    Best-effort: needs gh and an open PR; opt out per repo with
+    `git config tokenchecker.comment false`. Never blocks the push."""
+    repo = repo_root(args.repo)
+    if not repo or not shutil.which("gh"):
+        return
+    if git(repo, "config", "--get", "tokenchecker.comment",
+           check=False).strip() == "false":
+        return
+    try:
+        ns = argparse.Namespace(**vars(args))
+        ns.pr = None
+        ns.branch = None
+        ns.refs_only = False
+        cmd_comment(ns)
+    except Exception as exc:
+        log_event(repo, f"comment FAILED: {exc}")
 
 
 def cmd_report(args):
@@ -1456,7 +1555,32 @@ def cmd_install_global(args):
     return 0
 
 WORKFLOW_PATH = ".github/workflows/token-usage.yml"
-WORKFLOW_YAML = """\
+ACTION_REF = "ZohaibAhmed/tokenchecker@v0"
+
+# Default workflow: a few boilerplate lines that never change. The composite
+# action (action.yml in the tokenchecker repo) does the work — checkout,
+# pip install from PyPI, fetch refs, upsert the comment.
+WORKFLOW_YAML = f"""\
+name: AI Token Usage
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  token-usage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {ACTION_REF}
+"""
+
+# --vendor variant: fully self-contained, runs the vendored copy of this
+# script — for repos that can't depend on PyPI or third-party actions.
+WORKFLOW_YAML_VENDORED = """\
 name: AI Token Usage
 
 on:
@@ -1515,8 +1639,10 @@ jobs:
             }
 """
 
-CLAUDE_HOOK_COMMAND = ("python3 \"$CLAUDE_PROJECT_DIR/scripts/tokenchecker.py\" "
-                       "sync --quiet >/dev/null 2>&1 || true")
+CLAUDE_HOOK_COMMAND = (
+    "f=\"$CLAUDE_PROJECT_DIR/scripts/tokenchecker.py\"; "
+    "[ -f \"$f\" ] || f=\"$HOME/.tokenchecker/tokenchecker.py\"; "
+    "python3 \"$f\" sync --quiet >/dev/null 2>&1 || true")
 
 
 def cmd_install(args):
@@ -1526,12 +1652,13 @@ def cmd_install(args):
         return 1
     changed = []
 
-    # 1. vendor this script at scripts/tokenchecker.py
+    # 1. vendor this script only when asked (--vendor) or when a previous
+    # install already vendored it (keep legacy repos' CI working)
     dst = os.path.join(repo, "scripts", "tokenchecker.py")
-    src = os.path.realpath(__file__)
-    if os.path.realpath(dst) != src:
+    vendored = args.vendor or os.path.exists(dst)
+    if vendored and os.path.realpath(dst) != os.path.realpath(__file__):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy2(src, dst)
+        shutil.copy2(os.path.realpath(__file__), dst)
         os.chmod(dst, 0o755)
         changed.append("scripts/tokenchecker.py")
 
@@ -1559,7 +1686,7 @@ def cmd_install(args):
     if not os.path.exists(wf_path):
         os.makedirs(os.path.dirname(wf_path), exist_ok=True)
         with open(wf_path, "w", encoding="utf-8") as fh:
-            fh.write(WORKFLOW_YAML)
+            fh.write(WORKFLOW_YAML_VENDORED if vendored else WORKFLOW_YAML)
         changed.append(WORKFLOW_PATH)
 
     # 4. optional Claude Code SessionEnd hook (project settings)
@@ -1576,11 +1703,14 @@ def cmd_install(args):
         print("\nGlobal install detected (core.hooksPath dispatcher): skipped the "
               "per-repo pre-push hook,\nsince the dispatcher already syncs on push.")
     print("\nNext steps:")
-    print("  1. Commit scripts/tokenchecker.py and .github/workflows/token-usage.yml")
-    print("  2. Every contributor runs: python3 scripts/tokenchecker.py install")
-    print("     (sets up their local pre-push hook; not needed with install --global)")
-    print("  3. Token usage syncs automatically on every git push;")
-    print("     run `python3 scripts/tokenchecker.py sync` to publish manually.")
+    if vendored:
+        print("  1. Commit scripts/tokenchecker.py and .github/workflows/token-usage.yml")
+    else:
+        print(f"  1. Commit {WORKFLOW_PATH} (a few lines; runs {ACTION_REF})")
+    print("  2. Contributors run `tokenchecker install --global` once per machine")
+    print("     (or `tokenchecker install` per clone)")
+    print("  3. Usage syncs on every git push; with `gh` installed the PR comment")
+    print("     is also posted straight from your machine — CI is a backstop.")
     return 0
 
 
@@ -1671,13 +1801,24 @@ def main(argv=None):
                    help="ignore the local store; use only synced refs (for CI)")
     p.set_defaults(fn=cmd_report)
 
+    p = sub.add_parser("comment", help="post/update the token-usage comment on the branch's PR (needs gh)")
+    common(p)
+    p.add_argument("--pr", type=int, default=None, help="PR number (default: open PR for the branch)")
+    p.add_argument("--branch", default=None, help="branch to report on (default: current)")
+    p.add_argument("--refs-only", dest="refs_only", action="store_true",
+                   help="ignore the local store; use only synced refs (for CI)")
+    p.set_defaults(fn=cmd_comment)
+
     p = sub.add_parser("status", help="show when tokenchecker last ran and what is synced")
     common(p)
     p.add_argument("--log-lines", type=int, default=10, help="log lines to show (default 10)")
     p.set_defaults(fn=cmd_status)
 
-    p = sub.add_parser("install", help="vendor script, add pre-push hook + workflow")
+    p = sub.add_parser("install", help="add pre-push hook + minimal GitHub workflow")
     common(p)
+    p.add_argument("--vendor", action="store_true",
+                   help="embed the script at scripts/tokenchecker.py and use a "
+                        "self-contained workflow (no PyPI / third-party action in CI)")
     p.add_argument("--claude-hook", action="store_true",
                    help="also add a Claude Code SessionEnd hook to .claude/settings.json")
     p.add_argument("--global", dest="global_install", action="store_true",

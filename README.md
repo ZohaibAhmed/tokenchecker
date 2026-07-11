@@ -39,10 +39,12 @@ override with env vars elsewhere).
    there are never conflicts, and no external storage is needed. Records are idempotent —
    re-collecting and re-pushing never double-counts.
 3. A `pre-push` git hook runs `sync` (= collect + push) automatically, so usage data
-   reaches origin together with the branch you're about to open a PR for.
-4. On `pull_request` (opened / synchronize / reopened) the GitHub Action fetches all
-   `refs/token-usage/*` refs, aggregates every machine's records for the head branch, and
-   creates/updates a single sticky PR comment.
+   reaches origin together with the branch you're about to open a PR for. If the branch
+   has an open PR and the `gh` CLI is available, the hook also upserts the sticky PR
+   comment right then — **no CI or repo files required**.
+4. Optionally, a tiny committed workflow re-renders the comment on every
+   `pull_request` event via the `ZohaibAhmed/tokenchecker@v0` action, so the comment
+   stays current no matter who pushes or whether they have `gh`.
 
 ## Setup
 
@@ -72,40 +74,49 @@ per-repo, per-clone setup.
 - Hook runs are quiet when there is nothing new; you only see output when records are
   actually collected or pushed.
 
-PR comments still need two committed files per repository (CI can't read your laptop):
-run `python3 ~/.tokenchecker/tokenchecker.py install` in the repo once and commit
-`scripts/tokenchecker.py` + `.github/workflows/token-usage.yml`.
+**PR comments need nothing more.** When you `git push` a branch with an open PR, the
+hook posts/updates the report comment straight from your machine using the `gh` CLI
+(opt out with `git config tokenchecker.comment false`). For teams that want the comment
+maintained by CI as well — so it updates regardless of who pushes — commit one small
+workflow per repo: run `tokenchecker install` there and commit
+`.github/workflows/token-usage.yml` (a dozen boilerplate lines that call the
+`ZohaibAhmed/tokenchecker@v0` action; the action pip-installs tokenchecker in CI, so
+there is nothing else to vendor or keep up to date).
 
 ### Per repository (alternative)
 
 ```bash
-# one time, by anyone: vendor the tool + workflow into the repo
-curl -fsSL https://raw.githubusercontent.com/<you>/tokenchecker/main/tokenchecker.py \
-  -o /tmp/tokenchecker.py            # or copy it from this repo
-python3 /tmp/tokenchecker.py install # run from inside the target repo
-git add scripts/tokenchecker.py .github/workflows/token-usage.yml
-git commit -m "add tokenchecker"
+# one time, by anyone: add the CI workflow
+tokenchecker install                 # run from inside the target repo
+git add .github/workflows/token-usage.yml
+git commit -m "add tokenchecker workflow"
 
-# every contributor, once per clone (installs their local pre-push hook):
-python3 scripts/tokenchecker.py install
+# every contributor, once per machine:
+tokenchecker install --global        # (or `tokenchecker install` per clone)
 ```
 
 `install` is idempotent. It:
-- vendors the script at `scripts/tokenchecker.py` (committed, used by CI and teammates)
-- appends a guarded block to `.git/hooks/pre-push` (local; preserves existing hooks)
-- writes `.github/workflows/token-usage.yml` (committed)
+- writes `.github/workflows/token-usage.yml` (committed) — a few boilerplate lines
+  calling the `ZohaibAhmed/tokenchecker@v0` action, which installs tokenchecker from
+  PyPI in CI (pin with `with: {version: "tokenchecker==0.3.0"}` if you like)
+- appends a guarded block to `.git/hooks/pre-push` (local; preserves existing hooks;
+  skipped when the global install already covers the repo)
+- with `--vendor`, embeds the script at `scripts/tokenchecker.py` and writes a fully
+  self-contained workflow instead — for repos that can't use PyPI or third-party
+  actions in CI
 - with `--claude-hook`, also adds a Claude Code `SessionEnd` hook to
   `.claude/settings.json` so usage syncs when a Claude session ends, not just on push
 
 ## Commands
 
 ```bash
-python3 scripts/tokenchecker.py sync                 # collect + publish (what the hook runs)
-python3 scripts/tokenchecker.py collect --dry-run    # preview per-branch usage, write nothing
-python3 scripts/tokenchecker.py status               # when did it last run, what's synced where
-python3 scripts/tokenchecker.py report               # all branches, all machines
-python3 scripts/tokenchecker.py report --branch feature/x --markdown  # PR-comment format
-python3 scripts/tokenchecker.py report --json        # raw records
+tokenchecker sync                 # collect + publish (what the hook runs)
+tokenchecker collect --dry-run    # preview per-branch usage, write nothing
+tokenchecker status               # when did it last run, what's synced where
+tokenchecker report               # all branches, all machines, with costs
+tokenchecker report --branch feature/x --markdown  # PR-comment format
+tokenchecker report --json        # raw records
+tokenchecker comment              # post/update the PR comment for this branch (gh)
 ```
 
 ## Seeing it run

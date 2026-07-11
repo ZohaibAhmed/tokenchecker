@@ -22,9 +22,7 @@ jobs:
         with:
           python-version: "3.x"
       - name: Regenerate embedded prices
-        run: |
-          python3 scripts/update_prices.py
-          cp tokenchecker.py scripts/tokenchecker.py
+        run: python3 scripts/update_prices.py
       - uses: peter-evans/create-pull-request@v7
         with:
           commit-message: "update embedded model prices from LiteLLM"

@@ -1,0 +1,30 @@
+name: tokenchecker
+description: >-
+  Post per-branch AI coding-agent token usage (synced via refs/token-usage/*)
+  as a sticky PR comment, with cost estimates.
+branding:
+  icon: bar-chart-2
+  color: purple
+
+inputs:
+  version:
+    description: pip requirement spec for tokenchecker (e.g. "tokenchecker==0.3.0")
+    required: false
+    default: tokenchecker
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
+    - name: Report token usage on the PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        python3 -m pip install --quiet "${{ inputs.version }}"
+        tokenchecker comment --refs-only \
+          --pr "${{ github.event.pull_request.number }}" \
+          --branch "${{ github.head_ref }}"

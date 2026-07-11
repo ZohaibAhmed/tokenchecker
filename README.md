@@ -1,3 +1,5 @@
+<img width="799" height="315" alt="image" src="https://github.com/user-attachments/assets/ff05906a-74b5-4daa-8108-e33a6dc3f417" />
+
 # tokenchecker
 
 Count AI coding-agent tokens **per git branch** — across sessions and machines — and post

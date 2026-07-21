@@ -6,7 +6,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*.*.*"]  # not the floating v0 tag — it points at an already-published commit
 
 jobs:
   build:

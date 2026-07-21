@@ -101,6 +101,8 @@ tokenchecker install --global        # (or `tokenchecker install` per clone)
   PyPI in CI (pin with `with: {version: "tokenchecker==0.3.0"}` if you like)
 - appends a guarded block to `.git/hooks/pre-push` (local; preserves existing hooks;
   skipped when the global install already covers the repo)
+- keeps a copy of the script at `~/.tokenchecker/tokenchecker.py` so the hook can
+  always run it, regardless of the shell environment git hooks execute in
 - with `--vendor`, embeds the script at `scripts/tokenchecker.py` and writes a fully
   self-contained workflow instead — for repos that can't use PyPI or third-party
   actions in CI

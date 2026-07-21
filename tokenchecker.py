@@ -17,7 +17,7 @@ Commands:
   install   add pre-push hook + minimal GitHub workflow (--vendor to embed)
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import argparse
 import getpass
@@ -1464,6 +1464,10 @@ if [ -z "$TOKENCHECKER_SKIP" ]; then
   _tc_root="$(git rev-parse --show-toplevel 2>/dev/null)"
   if [ -n "$_tc_root" ] && [ -f "$_tc_root/scripts/tokenchecker.py" ]; then
     TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync --hook || true
+  elif [ -f "$HOME/.tokenchecker/tokenchecker.py" ]; then
+    TOKENCHECKER_SKIP=1 python3 "$HOME/.tokenchecker/tokenchecker.py" sync --hook || true
+  elif command -v tokenchecker >/dev/null 2>&1; then
+    TOKENCHECKER_SKIP=1 tokenchecker sync --hook || true
   fi
 fi
 # <<< tokenchecker pre-push <<<
@@ -1661,6 +1665,15 @@ def cmd_install(args):
         shutil.copy2(os.path.realpath(__file__), dst)
         os.chmod(dst, 0o755)
         changed.append("scripts/tokenchecker.py")
+    if not vendored:
+        # the pre-push hook falls back to ~/.tokenchecker/tokenchecker.py, so
+        # keep a copy there — the hook's shell has no pip environment on PATH
+        home_copy = os.path.join(tc_home(), "tokenchecker.py")
+        if os.path.realpath(home_copy) != os.path.realpath(__file__):
+            os.makedirs(tc_home(), exist_ok=True)
+            shutil.copy2(os.path.realpath(__file__), home_copy)
+            os.chmod(home_copy, 0o755)
+            changed.append(home_copy)
 
     # 2. pre-push hook. Always target the repo's OWN hooks dir — the effective
     # dir (rev-parse --git-path hooks) may be a core.hooksPath shared across

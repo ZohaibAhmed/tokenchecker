@@ -39,6 +39,9 @@ def main():
               if KEEP.match(name) and not DROP.search(name)}
     if len(subset) < 20:
         raise SystemExit(f"suspiciously few embedded models ({len(subset)}); aborting")
+    if subset == tokenchecker.EMBEDDED_PRICES:
+        print("embedded prices already up to date")
+        return
 
     today = datetime.date.today().isoformat()
     lines = [BEGIN, f'EMBEDDED_PRICES_DATE = "{today}"', "EMBEDDED_PRICES = {"]

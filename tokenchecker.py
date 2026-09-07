@@ -24,9 +24,11 @@ import getpass
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -96,7 +98,12 @@ def parse_ts(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return value / 1000.0 if value > 4e10 else float(value)
+        try:
+            ts = value / 1000.0 if value > 4e10 else float(value)
+            datetime.fromtimestamp(ts, tz=timezone.utc)
+            return ts
+        except (ValueError, OverflowError, OSError):
+            return None
     s = str(value).strip()
     if not s:
         return None
@@ -128,7 +135,7 @@ def norm_remote_url(url):
 
 
 def path_inside(path, root):
-    if not path:
+    if not path or not isinstance(path, (str, os.PathLike)):
         return False
     try:
         p = os.path.realpath(path)
@@ -163,7 +170,9 @@ class BranchTimeline:
             if m:
                 self.events.append((int(m.group(1)), m.group(3)))
                 self.first_from = m.group(2)  # log -g is newest-first
-        self.events.sort()
+        # Reflog is newest first. Preserve checkout order within the same second.
+        self.events.reverse()
+        self.events.sort(key=lambda event: event[0])
 
     def branch_at(self, ts):
         if ts is None:
@@ -222,6 +231,24 @@ def dedup(records):
         if prev is None or r.get("total", 0) > prev.get("total", 0):
             by_id[rid] = r
     return list(by_id.values())
+
+
+def jsonl_objects(lines):
+    """Ignore incomplete writes and non-object JSON without losing other events."""
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            yield value
+
+
+def valid_counts(value, fields):
+    return isinstance(value, dict) and all(
+        value.get(field) is None or
+        (type(value[field]) is int and value[field] >= 0)
+        for field in fields)
 
 
 # ----------------------------------------------------------------- pricing
@@ -454,7 +481,21 @@ def prices_cache_path():
     return os.path.join(tc_home(), "prices.json")
 
 
-def resolve_prices():
+def validate_prices(data):
+    """Reject malformed overrides/caches before they can break report rendering."""
+    if not isinstance(data, dict) or not data:
+        raise ValueError("prices must be a nonempty model map")
+    for model, rates in data.items():
+        if not isinstance(rates, dict) or not {"input", "output"} <= rates.keys():
+            raise ValueError(f"missing input/output rates for {model}")
+        for field in ("input", "output", "cache_read", "cache_write"):
+            rate = rates.get(field, 0)
+            if not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate < 0:
+                raise ValueError(f"invalid {field} rate for {model}")
+    return data
+
+
+def resolve_prices(write_cache=True):
     """-> (prices dict or {}, source label, source date) trying override/live/cache/embedded."""
     override = os.environ.get("TOKENCHECKER_PRICES")
     if override:
@@ -462,11 +503,12 @@ def resolve_prices():
             with open(override, encoding="utf-8") as fh:
                 data = json.load(fh)
             if isinstance(data, dict) and "prices" in data:
-                return data["prices"], "custom", data.get("date", "")
-            try:
+                return validate_prices(data["prices"]), "custom", str(data.get("date", ""))
+            if isinstance(data, dict) and any(
+                    isinstance(v, dict) and "input_cost_per_token" in v
+                    for v in data.values()):
                 return parse_litellm_prices(data), "custom", ""
-            except ValueError:
-                return data, "custom", ""  # already our {model: {...}} schema
+            return validate_prices(data), "custom", ""
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             eprint(f"tokenchecker: could not read TOKENCHECKER_PRICES ({exc}); "
                    "falling back")
@@ -475,21 +517,28 @@ def resolve_prices():
     try:
         with open(cache_file, encoding="utf-8") as fh:
             cached = json.load(fh)
-    except (OSError, json.JSONDecodeError, ValueError):
+        if not isinstance(cached, dict):
+            raise ValueError("cache must be an object")
+        validate_prices(cached.get("prices"))
+        cache_date = datetime.fromisoformat(cached["date"])
+        if cache_date.tzinfo is None:
+            cache_date = cache_date.replace(tzinfo=timezone.utc)
+    except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError):
         cached = None
     now = datetime.now(timezone.utc)
     if cached and cached.get("date"):
-        age = now - datetime.fromisoformat(cached["date"]).replace(tzinfo=timezone.utc)
+        age = now - cache_date
         if age < timedelta(days=PRICES_CACHE_TTL_DAYS):
             return cached["prices"], "cached", cached["date"][:10]
     if not os.environ.get("TOKENCHECKER_NO_NETWORK"):
         try:
             prices = fetch_live_prices()
             try:
-                os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-                with open(cache_file, "w", encoding="utf-8") as fh:
-                    json.dump({"date": now.strftime("%Y-%m-%dT%H:%M:%S"),
-                               "prices": prices}, fh)
+                if write_cache:
+                    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+                    with open(cache_file, "w", encoding="utf-8") as fh:
+                        json.dump({"date": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                                   "prices": prices}, fh)
             except OSError:
                 pass
             return prices, "live", now.strftime("%Y-%m-%d")
@@ -569,7 +618,7 @@ def collect_claude(repo, since_ts, timeline):
             candidates.append(os.path.join(base, d))
     records = []
     for pdir in candidates:
-        for fp in glob.glob(os.path.join(pdir, "*.jsonl")):
+        for fp in glob.glob(os.path.join(pdir, "**", "*.jsonl"), recursive=True):
             try:
                 if os.path.getmtime(fp) < since_ts:
                     continue
@@ -586,16 +635,16 @@ def _parse_claude_file(fp, repo, since_ts, timeline):
     except OSError:
         return out
     with fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
+        for d in jsonl_objects(fh):
             if d.get("type") != "assistant":
                 continue
             msg = d.get("message") or {}
+            if not isinstance(msg, dict):
+                continue
             usage = msg.get("usage") or {}
-            if not usage:
+            if not usage or not valid_counts(usage, (
+                    "input_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens", "output_tokens")):
                 continue
             if not path_inside(d.get("cwd"), repo):
                 continue
@@ -649,6 +698,7 @@ def collect_codex(repo, since_ts, timeline, origin_urls):
 def _parse_codex_file(fp, repo, since_ts, timeline, origin_urls):
     session_id = None
     session_ts = None
+    started_ts = None
     branch = None
     model = None
     matched = False
@@ -658,17 +708,18 @@ def _parse_codex_file(fp, repo, since_ts, timeline, origin_urls):
     except OSError:
         return None
     with fh:
-        for line in fh:
-            try:
-                d = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                continue
+        for d in jsonl_objects(fh):
             t = d.get("type")
             p = d.get("payload") or {}
+            if not isinstance(p, dict):
+                continue
             if t == "session_meta":
                 session_id = p.get("id")
                 session_ts = parse_ts(p.get("timestamp") or d.get("timestamp"))
+                started_ts = session_ts
                 gitinfo = p.get("git") or {}
+                if not isinstance(gitinfo, dict):
+                    gitinfo = {}
                 branch = gitinfo.get("branch")
                 if path_inside(p.get("cwd"), repo):
                     matched = True
@@ -680,8 +731,13 @@ def _parse_codex_file(fp, repo, since_ts, timeline, origin_urls):
                 model = p.get("model") or model
             elif t == "event_msg" and p.get("type") == "token_count":
                 info = p.get("info") or {}
+                if not isinstance(info, dict):
+                    continue
                 usage = info.get("total_token_usage") or {}
-                if usage and usage.get("total_tokens", 0) >= (best or {}).get("total_tokens", 0):
+                if not valid_counts(usage, ("input_tokens", "cached_input_tokens",
+                                           "output_tokens", "total_tokens")):
+                    continue
+                if usage and (usage.get("total_tokens") or 0) >= ((best or {}).get("total_tokens") or 0):
                     best = usage
                     session_ts = parse_ts(d.get("timestamp")) or session_ts
     if not (matched and best and session_id):
@@ -689,7 +745,7 @@ def _parse_codex_file(fp, repo, since_ts, timeline, origin_urls):
     if session_ts and session_ts < since_ts:
         return None
     if not branch:
-        branch = timeline.branch_at(session_ts)
+        branch = timeline.branch_at(started_ts)
     cached = best.get("cached_input_tokens", 0) or 0
     input_total = best.get("input_tokens", 0) or 0
     return make_record(
@@ -743,13 +799,17 @@ def _parse_gemini_session(fp, since_ts, timeline):
             d = json.load(fh)
     except (OSError, json.JSONDecodeError, ValueError):
         return []
+    if not isinstance(d, dict):
+        return []
     session = d.get("sessionId") or os.path.basename(fp)
     out = []
     for m in d.get("messages") or []:
         if not isinstance(m, dict):
             continue
         tokens = m.get("tokens") or {}
-        if not tokens or not tokens.get("total"):
+        if not valid_counts(tokens, ("input", "cached", "tool", "output", "thoughts", "total")):
+            continue
+        if not tokens.get("total"):
             continue
         ts = parse_ts(m.get("timestamp")) or parse_ts(d.get("lastUpdated"))
         if ts and ts < since_ts:
@@ -837,7 +897,11 @@ def collect_cursor(repo, since_ts, timeline):
                     b = json.loads(value)
                 except (json.JSONDecodeError, TypeError, ValueError):
                     continue
+                if not isinstance(b, dict):
+                    continue
                 tc = b.get("tokenCount") or {}
+                if not valid_counts(tc, ("inputTokens", "outputTokens")):
+                    continue
                 inp = tc.get("inputTokens", 0) or 0
                 outp = tc.get("outputTokens", 0) or 0
                 if inp + outp <= 0:
@@ -876,7 +940,7 @@ def _cursor_composers_for_repo(ws_dir, repo):
             continue
         from urllib.parse import unquote, urlparse
         folder_path = unquote(urlparse(folder).path)
-        if not (path_inside(folder_path, repo) or path_inside(repo, folder_path)):
+        if not path_inside(folder_path, repo):
             continue
         wdb = os.path.join(os.path.dirname(wj), "state.vscdb")
         if not os.path.exists(wdb):
@@ -980,14 +1044,22 @@ def log_event(repo, message):
 
 def load_jsonl(text):
     records = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
+    for record in jsonl_objects(text.splitlines()):
+        if not isinstance(record.get("id"), str) or not record["id"]:
             continue
-        try:
-            records.append(json.loads(line))
-        except (json.JSONDecodeError, ValueError):
+        if not all(isinstance(record.get(field, ""), str)
+                   for field in ("tool", "model", "branch", "machine")):
             continue
+        if record.get("session") is not None and not isinstance(record["session"], str):
+            continue
+        if not valid_counts(record, ("input", "cache_read", "cache_write", "output", "total")):
+            continue
+        if record.get("total") is None:
+            continue
+        if record.get("ts") is not None and (
+                not isinstance(record["ts"], str) or parse_ts(record["ts"]) is None):
+            continue
+        records.append(record)
     return records
 
 
@@ -1003,9 +1075,15 @@ def save_local(repo, records):
     path = local_store_path(repo)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     records = sorted(records, key=lambda r: (r.get("ts") or "", r["id"]))
-    with open(path, "w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, sort_keys=True) + "\n")
+    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".records-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(json.dumps(r, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def read_ref_records(repo, ref):
@@ -1203,15 +1281,22 @@ def cmd_collect(args):
         counts[name] = len(recs)
         collected.extend(recs)
     if args.dry_run:
-        prices, label, date = resolve_prices()
+        prices, label, date = resolve_prices(write_cache=False)
         print(render_text(dedup(collected), prices=prices, price_source=(label, date)))
         if not args.quiet:
             eprint("dry run — nothing written. per-source records: "
                    + ", ".join(f"{k}={v}" for k, v in counts.items()))
         return 0
-    existing = load_local(repo)
-    merged = dedup(existing + collected)
-    save_local(repo, merged)
+    # Hooks and SessionEnd can collect simultaneously. Lock the read/merge/write,
+    # while publishing atomically so reports never see a partially written file.
+    import fcntl
+    lock_path = local_store_path(repo) + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        existing = load_local(repo)
+        merged = dedup(existing + collected)
+        save_local(repo, merged)
     new = len(merged) - len(dedup(existing))
     hook_mode = getattr(args, "hook", False)
     summary = (f"collected {len(collected)} records "
@@ -1236,13 +1321,22 @@ def cmd_push(args):
             print("tokenchecker: no local records to push")
         return 0
     ref = REF_PREFIX + machine_id()
-    merged = dedup(read_ref_records(repo, ref) + records)
+    # A machine can have several clones/worktrees, or publish to several remotes.
+    # Merge the destination's current snapshot, not just this clone's local ref.
+    remote = args.remote
+    advertised = git(repo, "ls-remote", "--refs", remote, ref).splitlines()
+    previous = advertised[0].split()[0] if advertised else ""
+    remote_records = []
+    if previous:
+        git(repo, "fetch", "--no-tags", remote, ref)
+        remote_records = read_ref_records(repo, previous)
+    merged = dedup(remote_records + read_ref_records(repo, ref) + records)
     payload = "".join(
         json.dumps(r, sort_keys=True) + "\n"
         for r in sorted(merged, key=lambda r: (r.get("ts") or "", r["id"]))
     )
-    # the local ref tracks the last successful push; skip no-op force pushes
-    if git(repo, "cat-file", "blob", f"{ref}:{RECORDS_BLOB}", check=False) == payload:
+    if previous and git(repo, "cat-file", "blob", f"{previous}:{RECORDS_BLOB}") == payload:
+        git(repo, "update-ref", ref, previous)
         if not args.quiet and not hook_mode:
             print(f"tokenchecker: {ref} already up to date ({len(merged)} records)")
         return 0
@@ -1250,9 +1344,9 @@ def cmd_push(args):
     tree = git(repo, "mktree", input_=f"100644 blob {blob}\t{RECORDS_BLOB}\n").strip()
     commit = git(repo, "commit-tree", tree, "-m",
                  f"tokenchecker records from {machine_id()}").strip()
-    remote = args.remote
     p = subprocess.run(
-        ["git", "-C", repo, "push", "--force", "--no-verify", remote, f"{commit}:{ref}"],
+        ["git", "-C", repo, "push", f"--force-with-lease={ref}:{previous}",
+         "--no-verify", remote, f"{commit}:{ref}"],
         env={**os.environ, "TOKENCHECKER_SKIP": "1"},
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
@@ -1270,7 +1364,7 @@ def cmd_push(args):
 
 def cmd_sync(args):
     rc = cmd_collect(args)
-    if rc != 0:
+    if rc != 0 or args.dry_run:
         return rc
     rc = cmd_push(args)
     if rc != 0:
@@ -1299,7 +1393,7 @@ def upsert_pr_comment(repo, pr, body):
         ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{pr}/comments",
          "--paginate", "--jq",
          f'.[] | select(.body | contains("{COMMENT_MARKER}")) | .id'],
-        cwd=repo, check=False).split()
+        cwd=repo).split()
     payload = json.dumps({"body": body})
     if existing:
         run(["gh", "api", "-X", "PATCH",
@@ -1460,14 +1554,14 @@ PRE_PUSH_END_MARKER = "# <<< tokenchecker pre-push <<<"
 PRE_PUSH_BLOCK = """
 # >>> tokenchecker pre-push >>>
 # Collect local AI agent token usage and publish it to refs/token-usage/<machine>
-if [ -z "$TOKENCHECKER_SKIP" ]; then
+if [ -z "$TOKENCHECKER_SKIP" ] && [ "$(git config --get tokenchecker.enabled)" != "false" ]; then
   _tc_root="$(git rev-parse --show-toplevel 2>/dev/null)"
   if [ -n "$_tc_root" ] && [ -f "$_tc_root/scripts/tokenchecker.py" ]; then
-    TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync --hook || true
-  elif [ -f "$HOME/.tokenchecker/tokenchecker.py" ]; then
-    TOKENCHECKER_SKIP=1 python3 "$HOME/.tokenchecker/tokenchecker.py" sync --hook || true
+    TOKENCHECKER_SKIP=1 python3 "$_tc_root/scripts/tokenchecker.py" sync --hook --remote "${1:-origin}" || true
+  elif [ -f "${TOKENCHECKER_HOME:-$HOME/.tokenchecker}/tokenchecker.py" ]; then
+    TOKENCHECKER_SKIP=1 python3 "${TOKENCHECKER_HOME:-$HOME/.tokenchecker}/tokenchecker.py" sync --hook --remote "${1:-origin}" || true
   elif command -v tokenchecker >/dev/null 2>&1; then
-    TOKENCHECKER_SKIP=1 tokenchecker sync --hook || true
+    TOKENCHECKER_SKIP=1 tokenchecker sync --hook --remote "${1:-origin}" || true
   fi
 fi
 # <<< tokenchecker pre-push <<<
@@ -1489,13 +1583,17 @@ DISPATCHER_TEMPLATE = """#!/bin/sh
 # Installed by `tokenchecker install --global`. Chains to the repository's own
 # .git/hooks/<name> first, then records AI token usage on pre-push.
 hook_name="$(basename "$0")"
-repo_hooks="$(git rev-parse --git-dir 2>/dev/null)/hooks"
+repo_hooks="$(git rev-parse --git-common-dir 2>/dev/null)/hooks"
 if [ -x "$repo_hooks/$hook_name" ]; then
-  "$repo_hooks/$hook_name" "$@" || exit $?
+  if [ "$hook_name" = "pre-push" ]; then
+    TOKENCHECKER_SKIP=1 "$repo_hooks/$hook_name" "$@" || exit $?
+  else
+    "$repo_hooks/$hook_name" "$@" || exit $?
+  fi
 fi
 if [ "$hook_name" = "pre-push" ] && [ -z "$TOKENCHECKER_SKIP" ]; then
   if [ "$(git config --get tokenchecker.enabled)" != "false" ]; then
-    TOKENCHECKER_SKIP=1 python3 "{script}" sync --hook || true
+    TOKENCHECKER_SKIP=1 python3 {script} sync --hook --remote "${{1:-origin}}" || true
   fi
 fi
 exit 0
@@ -1518,7 +1616,7 @@ def cmd_install_global(args):
         shutil.copy2(src, script_dst)
         os.chmod(script_dst, 0o755)
 
-    dispatcher = DISPATCHER_TEMPLATE.format(marker=DISPATCHER_MARKER, script=script_dst)
+    dispatcher = DISPATCHER_TEMPLATE.format(marker=DISPATCHER_MARKER, script=shlex.quote(script_dst))
     for name in CLIENT_HOOKS:
         hp = os.path.join(hooks_dir, name)
         with open(hp, "w", encoding="utf-8") as fh:
@@ -1529,7 +1627,7 @@ def cmd_install_global(args):
     os.makedirs(bin_dir, exist_ok=True)
     wrapper = os.path.join(bin_dir, "tokenchecker")
     with open(wrapper, "w", encoding="utf-8") as fh:
-        fh.write(f"#!/bin/sh\nexec python3 \"{script_dst}\" \"$@\"\n")
+        fh.write(f"#!/bin/sh\nexec python3 {shlex.quote(script_dst)} \"$@\"\n")
     os.chmod(wrapper, 0o755)
 
     current = run(["git", "config", "--global", "--get", "core.hooksPath"],
@@ -1554,12 +1652,17 @@ def cmd_install_global(args):
     print("  - opt a repo out with:  git config tokenchecker.enabled false")
     print("  - repos that set core.hooksPath locally (e.g. husky) bypass this;")
     print("    add the sync line to their hook system or run `install` per-repo")
-    print("  - PR comments still need the workflow committed once per repo:")
-    print("    run `tokenchecker install` there and commit scripts/ + .github/")
+    print("  - PR comments use gh locally; for CI as well, run `tokenchecker install`")
+    print("    in each repo and commit .github/workflows/token-usage.yml")
     return 0
 
 WORKFLOW_PATH = ".github/workflows/token-usage.yml"
 ACTION_REF = "ZohaibAhmed/tokenchecker@v0"
+# Exact stock workflows from 0.3.1; never replace user-customized workflows.
+LEGACY_WORKFLOW_HASHES = {
+    "5244e5a02b7ca9ee8c9e07ef3920adfee8ce6fa522749cb6056ec92c9fc50488",
+    "3452fdbcb8380ed9e191de2fa553ab92d5c57a756df4dde927dc9eb57b241ef9",
+}
 
 # Default workflow: a few boilerplate lines that never change. The composite
 # action (action.yml in the tokenchecker repo) does the work — checkout,
@@ -1577,6 +1680,7 @@ permissions:
 
 jobs:
   token-usage:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: {ACTION_REF}
@@ -1597,17 +1701,22 @@ permissions:
 
 jobs:
   token-usage:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
 
       - name: Fetch token-usage refs
         run: git fetch origin '+refs/token-usage/*:refs/token-usage/*' || true
 
       - name: Build report
+        env:
+          TOKENCHECKER_BRANCH: ${{ github.head_ref }}
         run: |
           python3 scripts/tokenchecker.py report \\
-            --branch "${{ github.head_ref }}" \\
+            --branch "$TOKENCHECKER_BRANCH" \\
             --refs-only --markdown > tokenchecker-report.md
           cat tokenchecker-report.md
           cat tokenchecker-report.md >> "$GITHUB_STEP_SUMMARY"
@@ -1619,7 +1728,7 @@ jobs:
             const fs = require('fs');
             const body = fs.readFileSync('tokenchecker-report.md', 'utf8');
             const marker = '<!-- tokenchecker-report -->';
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
@@ -1696,7 +1805,11 @@ def cmd_install(args):
 
     # 3. GitHub workflow
     wf_path = os.path.join(repo, WORKFLOW_PATH)
-    if not os.path.exists(wf_path):
+    stock_legacy = False
+    if os.path.exists(wf_path):
+        with open(wf_path, "rb") as fh:
+            stock_legacy = hashlib.sha256(fh.read()).hexdigest() in LEGACY_WORKFLOW_HASHES
+    if not os.path.exists(wf_path) or stock_legacy:
         os.makedirs(os.path.dirname(wf_path), exist_ok=True)
         with open(wf_path, "w", encoding="utf-8") as fh:
             fh.write(WORKFLOW_YAML_VENDORED if vendored else WORKFLOW_YAML)
@@ -1728,30 +1841,40 @@ def cmd_install(args):
 
 
 def _install_repo_hook(repo, changed):
-    hooks_dir = os.path.join(git_dir(repo), "hooks")
+    hooks_dir = git(repo, "rev-parse", "--git-common-dir").strip()
+    if not os.path.isabs(hooks_dir):
+        hooks_dir = os.path.join(repo, hooks_dir)
+    hooks_dir = os.path.join(hooks_dir, "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
     hook_path = os.path.join(hooks_dir, "pre-push")
     existing = ""
     if os.path.exists(hook_path):
         with open(hook_path, encoding="utf-8", errors="replace") as fh:
             existing = fh.read()
-    if PRE_PUSH_MARKER in existing:
-        # replace any stale block with the current one
-        pattern = re.compile(
+    wrapper_marker = "# tokenchecker repository hook dispatcher"
+    if wrapper_marker not in existing:
+        # Run existing hooks as their own program: appending after `exit 0`
+        # never runs, and appending shell to a Python hook corrupts it.
+        original = re.sub(
             re.escape(PRE_PUSH_MARKER) + r".*?" + re.escape(PRE_PUSH_END_MARKER) + r"\n?",
-            re.DOTALL)
-        updated = pattern.sub(PRE_PUSH_BLOCK.strip() + "\n", existing)
-        if updated != existing:
-            with open(hook_path, "w", encoding="utf-8") as fh:
-                fh.write(updated)
-            os.chmod(hook_path, 0o755)
-            changed.append(os.path.relpath(hook_path, repo) + " (hook block updated)")
-    else:
-        content = existing if existing.strip() else "#!/bin/sh\n"
+            "", existing, flags=re.DOTALL)
+        backup = os.path.join(hooks_dir, "pre-push.tokenchecker-original")
+        if original.strip() and original.strip() != "#!/bin/sh":
+            if os.path.exists(backup):
+                raise RuntimeError(f"refusing to overwrite existing hook backup: {backup}")
+            with open(backup, "w", encoding="utf-8") as fh:
+                fh.write(original)
+            os.chmod(backup, 0o755)
+    content = ("#!/bin/sh\n" + wrapper_marker + "\n"
+               'original="$(dirname "$0")/pre-push.tokenchecker-original"\n'
+               'if [ -x "$original" ]; then\n'
+               '  "$original" "$@" || exit $?\n'
+               'fi\n' + PRE_PUSH_BLOCK)
+    if content != existing:
         with open(hook_path, "w", encoding="utf-8") as fh:
-            fh.write(content.rstrip("\n") + "\n" + PRE_PUSH_BLOCK)
-        os.chmod(hook_path, 0o755)
+            fh.write(content)
         changed.append(os.path.relpath(hook_path, repo) + " (local, not committed)")
+    os.chmod(hook_path, 0o755)
 
 
 def _install_claude_hook(repo, changed):
@@ -1766,7 +1889,8 @@ def _install_claude_hook(repo, changed):
             return
     hooks = settings.setdefault("hooks", {})
     session_end = hooks.setdefault("SessionEnd", [])
-    if any(CLAUDE_HOOK_COMMAND in json.dumps(entry) for entry in session_end):
+    if any(h.get("command") == CLAUDE_HOOK_COMMAND
+           for entry in session_end for h in entry.get("hooks", [])):
         return
     session_end.append(
         {"hooks": [{"type": "command", "command": CLAUDE_HOOK_COMMAND}]})

@@ -20,11 +20,15 @@ runs:
       with:
         python-version: "3.x"
     - name: Report token usage on the PR
+      if: github.event.pull_request.head.repo.full_name == github.repository
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        TOKENCHECKER_REQUIREMENT: ${{ inputs.version }}
+        TOKENCHECKER_PR: ${{ github.event.pull_request.number }}
+        TOKENCHECKER_BRANCH: ${{ github.head_ref }}
       run: |
-        python3 -m pip install --quiet "${{ inputs.version }}"
+        python3 -m pip install --quiet "$TOKENCHECKER_REQUIREMENT"
         tokenchecker comment --refs-only \
-          --pr "${{ github.event.pull_request.number }}" \
-          --branch "${{ github.head_ref }}"
+          --pr "$TOKENCHECKER_PR" \
+          --branch "$TOKENCHECKER_BRANCH"

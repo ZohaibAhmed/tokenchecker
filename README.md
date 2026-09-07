@@ -36,7 +36,9 @@ override with env vars elsewhere).
    timestamp + machine), and stores them under `.git/tokenchecker/`.
 2. `tokenchecker push` publishes the machine's records to a custom git ref
    **`refs/token-usage/<machine-id>`** on origin. Each machine owns exactly one ref, so
-   there are never conflicts, and no external storage is needed. Records are idempotent —
+   no external storage is needed. Clones and worktrees on the same machine merge the
+   destination's existing records before publishing. Concurrent remote changes reject
+   the update safely; rerun `sync` to merge and retry. Records are idempotent —
    re-collecting and re-pushing never double-counts.
 3. A `pre-push` git hook runs `sync` (= collect + push) automatically, so usage data
    reaches origin together with the branch you're about to open a PR for. If the branch
@@ -99,7 +101,8 @@ tokenchecker install --global        # (or `tokenchecker install` per clone)
 - writes `.github/workflows/token-usage.yml` (committed) — a few boilerplate lines
   calling the `ZohaibAhmed/tokenchecker@v0` action, which installs tokenchecker from
   PyPI in CI (pin with `with: {version: "tokenchecker==0.3.0"}` if you like)
-- appends a guarded block to `.git/hooks/pre-push` (local; preserves existing hooks;
+- installs a guarded wrapper at `.git/hooks/pre-push` (local; preserves an existing
+  hook as `pre-push.tokenchecker-original` and runs it first, including its exit status;
   skipped when the global install already covers the repo)
 - keeps a copy of the script at `~/.tokenchecker/tokenchecker.py` so the hook can
   always run it, regardless of the shell environment git hooks execute in
@@ -109,11 +112,18 @@ tokenchecker install --global        # (or `tokenchecker install` per clone)
 - with `--claude-hook`, also adds a Claude Code `SessionEnd` hook to
   `.claude/settings.json` so usage syncs when a Claude session ends, not just on push
 
+After upgrading, rerun `install --global` to refresh global hooks and `install` in
+repositories using per-repo hooks or workflows. The installer updates unchanged stock
+workflows from 0.3.1 and preserves customized workflows. Vendored workflows run the
+script from the PR's base commit; commit the initial vendored setup to the base branch
+before relying on its PR reports.
+
 ## Commands
 
 ```bash
 tokenchecker sync                 # collect + publish (what the hook runs)
 tokenchecker collect --dry-run    # preview per-branch usage, write nothing
+tokenchecker sync --dry-run       # preview collection without pushing or commenting
 tokenchecker status               # when did it last run, what's synced where
 tokenchecker report               # all branches, all machines, with costs
 tokenchecker report --branch feature/x --markdown  # PR-comment format
@@ -190,7 +200,8 @@ a footnote — never silently counted as $0 without a trace.
 - Tokens spent on a machine only reach the PR after that machine pushes (any push — the
   hook publishes usage for all branches, not just the pushed one) or runs `sync` manually.
 - Forks: contributors pushing from forks publish `refs/token-usage/*` to their fork, which
-  the base repo's Action can't see. Same-repo branches are fully supported.
+  the base repo's Action can't see. The generated workflow skips fork PRs. Same-repo
+  branches are fully supported.
 
 ## Env overrides
 
@@ -205,4 +216,11 @@ recursion).
 
 Usage refs are plain git refs; delete them with
 `git push origin --delete refs/token-usage/<machine-id>` and remove
-`.git/tokenchecker/` locally. Nothing else is stored anywhere.
+`.git/tokenchecker/` locally. Installed hooks, `~/.tokenchecker/` (including the price
+cache), and any installed workflow or Claude settings remain until removed separately.
+
+## Development
+
+Run the offline regression suite with `python3 -m unittest discover -s tests -v`.
+Tests use temporary repositories, local bare remotes, and isolated home directories.
+CI runs the suite on macOS and Linux with Python 3.9 and 3.14.
